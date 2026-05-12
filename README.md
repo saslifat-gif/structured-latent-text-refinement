@@ -22,7 +22,6 @@ structured draft
 This is **not** a general chatbot or GPT replacement.  
 The current working mode is **parallel latent refinement from a structured draft**.
 
-Repository: https://github.com/saslifat-gif/structured-latent-text-refinement
 
 ---
 
