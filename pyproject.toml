@@ -1,0 +1,26 @@
+[project]
+name = "structured-latent-text-refinement"
+version = "0.1.0"
+description = "Prompt-conditioned structured latent refinement for BERT text continuation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "datasets>=2.18",
+  "torch>=2.2",
+  "transformers>=4.40",
+  "pyyaml>=6.0",
+]
+
+[tool.setuptools]
+py-modules = [
+  "inference_stage2_conditional",
+  "parallel_decoder",
+  "stage2_config",
+  "stage2_data",
+  "stage2_eval",
+  "stage2_losses",
+  "stage2_riemannian",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"

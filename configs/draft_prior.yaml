@@ -1,0 +1,22 @@
+seed: 1337
+stage1_checkpoint: stage1_best.pt
+checkpoint: draft_prior_best.pt
+prompt_len: 16
+max_seq_len: 64
+train_size: 1000000
+training:
+  epochs: 20
+  batch_size: 512
+  lr: 0.00003
+draft_prior:
+  alpha: 0.7
+  layers: 4
+  heads: 8
+  ce_weight: 1.0
+  mse_weight: 0.05
+  cosine_weight: 0.05
+  norm_weight: 0.01
+  curriculum:
+    - [0, 0.00, 0.00]
+    - [2, 0.05, 0.00]
+    - [4, 0.05, 0.00]

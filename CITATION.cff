@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: Structured Latent Text Refinement
+message: If you use this project, please cite the repository.
+type: software
+authors:
+  - family-names: L.
+    given-names: Saslifat
+repository-code: https://github.com/saslifat-gif/structured-latent-text-refinement
+version: 0.1.0
+date-released: 2026-05-12

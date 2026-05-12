@@ -1,0 +1,36 @@
+seed: 1337
+stage1_checkpoint: stage1_best.pt
+draft_prior_checkpoint: draft_prior_best.pt
+checkpoint: stage2_conditional_flow_decoder_joint_best.pt
+prompt_len: 16
+max_seq_len: 64
+noise:
+  base_std: 0.30
+  target_latent_mean: -0.003
+  target_latent_std: 0.280
+flow:
+  hidden_dim: 512
+  depth: 5
+  refine_scale: 0.01
+  velocity_clamp: 2.0
+metric:
+  hidden_dim: 256
+  log_bound: 0.50
+  reg: 0.0001
+training:
+  epochs: 20
+  train_size: 1000000
+  batch_size: 512
+  log_every: 50
+losses:
+  metric: 1.0
+  euclidean: 0.05
+  endpoint: 0.25
+  decode: 0.05
+  aux_token_ce: 0.25
+  rollout_flow_token_ce: 0.15
+inference:
+  ode_steps: 16
+  temperature: 0.8
+  top_k: 50
+  top_p: 0.95
