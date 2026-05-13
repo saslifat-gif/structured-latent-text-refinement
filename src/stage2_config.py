@@ -10,7 +10,7 @@ ROCSTORIES_SPLIT = "first2_last3"
 PROMPT_LEN = int(os.environ.get("PROMPT_LEN", "32" if DATASET_NAME == "rocstories" else "16"))
 COND_DROP_PROB = 0.10
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "64"))
-LATENT_DIM = int(os.environ.get("LATENT_DIM", "256"))
+LATENT_DIM = int(os.environ.get("LATENT_DIM", "768" if DATASET_NAME == "rocstories" else "256"))
 BASE_NOISE_STD = 0.30
 CALIBRATE_GENERATED_LATENTS = True
 TARGET_LATENT_MEAN = -0.003
@@ -18,7 +18,7 @@ TARGET_LATENT_STD = 0.280
 COMPILE_MODELS = False
 FAST_DEBUG = False
 TRAIN_SIZE = int(os.environ.get("TRAIN_SIZE", "1000000"))
-TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "512"))
+TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "768" if DATASET_NAME == "rocstories" else "512"))
 DATALOADER_NUM_WORKERS = 4
 FLOW_HIDDEN_DIM = 512
 FLOW_DEPTH = 5
