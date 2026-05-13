@@ -522,6 +522,51 @@ class LatentProjector(nn.Module):
         return z_gen + delta, delta
 
 
+class ResidualRefiner(nn.Module):
+    def __init__(
+        self,
+        latent_dim=256,
+        hidden_dim=512,
+        depth=2,
+        residual_scale=0.03,
+    ):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.prompt_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.in_proj = nn.Linear(latent_dim * 2 + 1, hidden_dim)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            for _ in range(depth)
+        ])
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z, z_prompt, pos, mask=None):
+        prompt = z_prompt.mean(dim=1).unsqueeze(1).expand_as(z)
+        prompt_h = self.prompt_proj(prompt)
+        h = self.in_proj(torch.cat([z, prompt, pos.unsqueeze(-1)], dim=-1)) + prompt_h
+        for block in self.blocks:
+            h = h + block(h)
+            if mask is not None:
+                h = h * mask.to(h.dtype).unsqueeze(-1)
+        raw_delta = self.out_proj(self.out_norm(h))
+        delta = self.residual_scale * torch.tanh(raw_delta)
+        if mask is not None:
+            delta = delta * mask.to(delta.dtype).unsqueeze(-1)
+        return z + delta, delta
+
+
 def prompt_condition(z_data, attention_mask, prompt_len=PROMPT_LEN):
     prompt_z = z_data[:, :prompt_len, :]
     prompt_mask = attention_mask[:, :prompt_len].to(prompt_z.dtype).unsqueeze(-1)

@@ -424,27 +424,28 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
         adapt_path = "stage2_conditional_decoder_adapt_best.pt"
         stage2_path = adapt_path if os.path.exists(adapt_path) else "stage2_conditional_best.pt"
 
-    encoder = BertEncoder().to(device)
-    decoder = ParallelDecoder(latent_dim=256).to(device)
-
     ckpt1 = torch.load(stage1_path, map_location=device, weights_only=False)
     print_checkpoint_summary("stage1", stage1_path, ckpt1)
+    latent_dim = ckpt1.get("latent_dim", 256)
+    encoder = BertEncoder().to(device)
+    decoder = ParallelDecoder(latent_dim=latent_dim).to(device)
     decoder.load_state_dict(ckpt1["decoder"])
     if "encoder" in ckpt1:
         encoder.load_state_dict(ckpt1["encoder"])
 
     ckpt2 = torch.load(stage2_path, map_location=device, weights_only=False)
     print_checkpoint_summary("stage2", stage2_path, ckpt2)
+    latent_dim = ckpt2.get("latent_dim", latent_dim)
     FLOW_REFINE_SCALE = ckpt2.get("flow_refine_scale", FLOW_REFINE_SCALE)
     VELOCITY_CLAMP = ckpt2.get("velocity_clamp", VELOCITY_CLAMP)
     print(f"flow_refine_scale={FLOW_REFINE_SCALE:.3f} velocity_clamp={VELOCITY_CLAMP:.3f}", flush=True)
     flow_net = FlowNet(
-        latent_dim=256,
+        latent_dim=latent_dim,
         hidden_dim=ckpt2.get("flow_hidden_dim", FLOW_HIDDEN_DIM),
         depth=ckpt2.get("flow_depth", FLOW_DEPTH),
     ).to(device)
     metric_net = MetricNet(
-        latent_dim=256,
+        latent_dim=latent_dim,
         hidden_dim=ckpt2.get("metric_hidden_dim", METRIC_HIDDEN_DIM),
         log_bound=ckpt2.get("metric_log_bound", METRIC_LOG_BOUND),
     ).to(device)
@@ -468,7 +469,7 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
         if os.path.exists(dp_path):
             dp_ckpt = torch.load(dp_path, map_location=device, weights_only=False)
             _dp = DenoisingPrior(
-                latent_dim=256,
+                latent_dim=dp_ckpt.get("latent_dim", latent_dim),
                 hidden_dim=dp_ckpt.get("denoising_hidden_dim", FLOW_HIDDEN_DIM),
                 num_layers=dp_ckpt.get("denoising_layers", 4),
                 num_heads=dp_ckpt.get("denoising_heads", 8),
@@ -476,9 +477,9 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
             _dp.load_state_dict(dp_ckpt["denoising_prior"])
             _dp.eval()
             if is_draft_prior:
-                start_prior = DraftPriorSampler(_dp, latent_dim=256, alpha=dp_alpha).to(device)
+                start_prior = DraftPriorSampler(_dp, latent_dim=latent_dim, alpha=dp_alpha).to(device)
             else:
-                start_prior = DenoisingPriorSampler(_dp, latent_dim=256, alpha=dp_alpha).to(device)
+                start_prior = DenoisingPriorSampler(_dp, latent_dim=latent_dim, alpha=dp_alpha).to(device)
             start_prior.eval()
             print(
                 f"loaded {'draft' if is_draft_prior else 'denoising'} prior from {dp_path} "
