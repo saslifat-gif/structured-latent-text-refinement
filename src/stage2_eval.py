@@ -236,6 +236,7 @@ def evaluate(
     start_mlp=None,
     aux_token_head=None,
     latent_projector=None,
+    residual_refiner=None,
     draft_start_fn=None,
 ):
     flow_net.eval()
@@ -248,6 +249,8 @@ def evaluate(
         aux_token_head.eval()
     if latent_projector is not None:
         latent_projector.eval()
+    if residual_refiner is not None:
+        residual_refiner.eval()
 
     val_loss = 0
     eval_rng_state = torch.random.get_rng_state()
@@ -269,6 +272,7 @@ def evaluate(
                     z_cond,
                     target_mask,
                     start_mlp=start_mlp,
+                    residual_refiner=residual_refiner,
                     z_draft_start=z_draft_start,
                 ).item()
     avg_val_loss = val_loss / len(val_loader)
@@ -300,6 +304,14 @@ def evaluate(
             z_target_start=z_real_suffix if STRUCTURED_TARGET_START else None,
         )
         z_projected_suffix = z_gen_suffix
+        if residual_refiner is not None:
+            pos_res = suffix_positions(B, S - PROMPT_LEN, device, z_real.dtype)
+            z_projected_suffix, _residual_delta = residual_refiner(
+                z_projected_suffix,
+                z_real[:, :PROMPT_LEN, :],
+                pos_res,
+                suffix_mask,
+            )
         if latent_projector is not None:
             z_projected_suffix, projector_delta = latent_projector(
                 z_gen_suffix,

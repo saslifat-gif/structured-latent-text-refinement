@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="results/rocstories")
     parser.add_argument("--stage1", default="stage1_best.pt")
     parser.add_argument("--stage2", default="stage2_conditional_flow_decoder_joint_best.pt")
+    parser.add_argument("--rocstories_file", default=None)
+    parser.add_argument("--skip_gpt2", action="store_true")
+    parser.add_argument("--skip_ours", action="store_true")
     parser.add_argument("--local_files_only", action="store_true")
     return parser.parse_args()
 
@@ -41,6 +45,11 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
 def main() -> None:
     args = parse_args()
+    rocstories_file = args.rocstories_file or os.environ.get("ROCSTORIES_FILE")
+    if not rocstories_file:
+        raise RuntimeError(
+            "benchmark_speed.py requires --rocstories_file or ROCSTORIES_FILE because HF ROCStories loading is unreliable."
+        )
     out_dir = ensure_output_dir(args.output_dir)
     rows = []
 
@@ -71,7 +80,13 @@ def main() -> None:
             args.stage1,
             "--stage2",
             args.stage2,
+            "--rocstories_file",
+            rocstories_file,
         ]
+        if args.skip_gpt2:
+            warmup_cmd.append("--skip_gpt2")
+        if args.skip_ours:
+            warmup_cmd.append("--skip_ours")
         if args.local_files_only:
             warmup_cmd.append("--local_files_only")
         subprocess.run(warmup_cmd, check=False)
@@ -99,7 +114,13 @@ def main() -> None:
                 args.stage1,
                 "--stage2",
                 args.stage2,
+                "--rocstories_file",
+                rocstories_file,
             ]
+            if args.skip_gpt2:
+                cmd.append("--skip_gpt2")
+            if args.skip_ours:
+                cmd.append("--skip_ours")
             if args.local_files_only:
                 cmd.append("--local_files_only")
             subprocess.run(cmd, check=False)

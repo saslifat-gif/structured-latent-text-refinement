@@ -23,7 +23,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 
 DIFFUSION_LM_REPORTED_MAUVE = 0.043
-SUPPORTED_LOCAL_LATENT_DIMS = {256}
+SUPPORTED_LOCAL_LATENT_DIMS = {256, 768}
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", choices=("fair", "full", "latent_dim", "all"), default="all")
     parser.add_argument("--max_seq_len", type=int, default=64)
     parser.add_argument("--prompt_len", type=int, default=16)
+    parser.add_argument(
+        "--split_strategy",
+        choices=("sentence", "token"),
+        default="sentence",
+        help="ROCStories split: first 2 sentences -> last 3 sentences, or legacy fixed-token 16/48.",
+    )
     parser.add_argument("--latent_dim", type=int, choices=(128, 256, 768), default=256)
     parser.add_argument("--ode_steps", type=int, nargs="+", choices=(0, 1, 2, 4, 8, 16), default=[0, 1, 2, 4, 8, 16])
     parser.add_argument("--batch_size", type=int, default=1)
@@ -45,12 +51,176 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_ours", action="store_true")
     parser.add_argument("--no_mauve", action="store_true")
     parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument(
+        "--rocstories_file",
+        default=None,
+        help="Local ROCStories/Story Cloze CSV, TSV, JSONL, or TXT file. Preferred when HF dataset scripts are unavailable.",
+    )
     parser.add_argument("--manual_draft_file", default=None, help="CSV/JSONL file with one draft field per ROCStories sample")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
-def load_rocstories(num_samples: int, prompt_len: int, max_seq_len: int, local_files_only: bool) -> list[dict[str, str]]:
+def sentence_parts_from_row(row: dict[str, Any]) -> list[str]:
+    sentence_key_sets = [
+        [f"sentence{i}" for i in range(1, 6)],
+        [f"Sentence{i}" for i in range(1, 6)],
+        [f"InputSentence{i}" for i in range(1, 5)] + ["RandomFifthSentenceQuiz1"],
+        [f"InputSentence{i}" for i in range(1, 5)] + ["RandomFifthSentenceQuiz2"],
+    ]
+    for keys in sentence_key_sets:
+        parts = [str(row.get(key, "")).strip() for key in keys]
+        if sum(bool(part) for part in parts) >= 5:
+            return parts
+
+    for prompt_key, continuation_key in (
+        ("prompt", "continuation"),
+        ("Prompt", "Continuation"),
+    ):
+        if row.get(prompt_key) and row.get(continuation_key):
+            prompt = str(row[prompt_key]).strip()
+            continuation = str(row[continuation_key]).strip()
+            prompt_parts = split_story_sentences(prompt)
+            continuation_parts = split_story_sentences(continuation)
+            parts = prompt_parts + continuation_parts
+            if len(parts) >= 5:
+                return parts[:5]
+    return []
+
+
+def split_story_sentences(text: str) -> list[str]:
+    import re
+
+    text = " ".join(str(text).strip().split())
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def story_text_from_row(row: dict[str, Any]) -> str:
+    sentence_parts = sentence_parts_from_row(row)
+    if sentence_parts:
+        return " ".join(sentence_parts)
+
+    for key in ("story", "text", "full_text", "Story", "Text"):
+        if row.get(key):
+            return str(row[key])
+    return ""
+
+
+def sentence_split_example(row: dict[str, Any], max_seq_len: int) -> dict[str, Any] | None:
+    sentences = sentence_parts_from_row(row)
+    if len(sentences) < 5:
+        sentences = split_story_sentences(story_text_from_row(row))
+    if len(sentences) < 5:
+        return None
+
+    prompt = " ".join(sentences[:2])
+    target = " ".join(sentences[2:5])
+    full_tokens = tokenize_text(f"{prompt} {target}")
+    prompt_tokens = tokenize_text(prompt)
+    target_tokens = tokenize_text(target)
+    if not prompt_tokens or not target_tokens:
+        return None
+    if len(full_tokens) > max_seq_len:
+        budget = max(max_seq_len - len(prompt_tokens), 1)
+        target_tokens = target_tokens[:budget]
+        full_tokens = prompt_tokens + target_tokens
+    if len(full_tokens) < 8:
+        return None
+    return {
+        "prompt": prompt,
+        "reference": " ".join(target_tokens),
+        "full_text": " ".join(full_tokens),
+        "prompt_len": len(prompt_tokens),
+        "target_len": len(target_tokens),
+        "split_strategy": "sentence",
+    }
+
+
+def token_split_example(row: dict[str, Any], prompt_len: int, max_seq_len: int) -> dict[str, Any] | None:
+    text = story_text_from_row(row)
+    tokens = tokenize_text(text)
+    if len(tokens) < max_seq_len:
+        return None
+    prompt = " ".join(tokens[:prompt_len])
+    suffix = " ".join(tokens[prompt_len:max_seq_len])
+    return {
+        "prompt": prompt,
+        "reference": suffix,
+        "full_text": " ".join(tokens[:max_seq_len]),
+        "prompt_len": prompt_len,
+        "target_len": max_seq_len - prompt_len,
+        "split_strategy": "token",
+    }
+
+
+def rows_to_examples(
+    raw_rows: list[dict[str, Any]],
+    num_samples: int,
+    prompt_len: int,
+    max_seq_len: int,
+    split_strategy: str,
+) -> list[dict[str, Any]]:
+    rows = []
+    for row in raw_rows:
+        if split_strategy == "sentence":
+            example = sentence_split_example(row, max_seq_len)
+        else:
+            example = token_split_example(row, prompt_len, max_seq_len)
+        if example is None:
+            continue
+        rows.append(example)
+        if len(rows) >= num_samples:
+            break
+    return rows
+
+
+def load_rocstories_file(
+    path: str | Path,
+    num_samples: int,
+    prompt_len: int,
+    max_seq_len: int,
+    split_strategy: str,
+) -> list[dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        raise RuntimeError(f"ROCStories file does not exist: {path}")
+
+    suffix = path.suffix.lower()
+    raw_rows: list[dict[str, Any]] = []
+    if suffix == ".jsonl":
+        with path.open("r", encoding="utf-8") as f:
+            raw_rows = [json.loads(line) for line in f if line.strip()]
+    elif suffix in (".csv", ".tsv"):
+        delimiter = "\t" if suffix == ".tsv" else ","
+        with path.open("r", newline="", encoding="utf-8") as f:
+            raw_rows = list(csv.DictReader(f, delimiter=delimiter))
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            raw_rows = [{"text": line.strip()} for line in f if line.strip()]
+
+    rows = rows_to_examples(raw_rows, num_samples, prompt_len, max_seq_len, split_strategy)
+    if not rows:
+        raise RuntimeError(
+            f"Loaded {path}, but found no stories long enough for max_seq_len={max_seq_len}. "
+            "For sentence mode, provide five-sentence ROCStories rows. For token mode, rows must have enough tokens."
+        )
+    return rows
+
+
+def load_rocstories(
+    num_samples: int,
+    prompt_len: int,
+    max_seq_len: int,
+    local_files_only: bool,
+    rocstories_file: str | None = None,
+    split_strategy: str = "sentence",
+) -> list[dict[str, Any]]:
+    if rocstories_file:
+        return load_rocstories_file(rocstories_file, num_samples, prompt_len, max_seq_len, split_strategy)
+
     errors = []
     download_config = DownloadConfig(local_files_only=local_files_only)
     candidates = [
@@ -74,29 +244,18 @@ def load_rocstories(num_samples: int, prompt_len: int, max_seq_len: int, local_f
     if dataset is None:
         raise RuntimeError(
             "Could not load ROCStories. Install/cache a ROCStories-compatible dataset first. "
+            "The old Hugging Face Story Cloze dataset script may fail on recent `datasets` releases; "
+            "prefer passing a local file with `--rocstories_file path/to/rocstories.csv`. "
             "Tried: " + " | ".join(errors)
         )
 
-    rows = []
-    for row in dataset:
-        text = row.get("story") or row.get("text")
-        if not text:
-            sentence_keys = [f"sentence{i}" for i in range(1, 6)]
-            text = " ".join(str(row.get(key, "")).strip() for key in sentence_keys)
-        tokens = tokenize_text(text)
-        if len(tokens) < max_seq_len:
-            continue
-        prompt = " ".join(tokens[:prompt_len])
-        suffix = " ".join(tokens[prompt_len:max_seq_len])
-        rows.append({"prompt": prompt, "reference": suffix, "full_text": " ".join(tokens[:max_seq_len])})
-        if len(rows) >= num_samples:
-            break
+    rows = rows_to_examples(list(dataset), num_samples, prompt_len, max_seq_len, split_strategy)
     if not rows:
-        raise RuntimeError("ROCStories loaded, but no examples were long enough for the requested 16/48 split.")
+        raise RuntimeError("ROCStories loaded, but no examples matched the requested split strategy.")
     return rows
 
 
-def attach_manual_drafts(rows: list[dict[str, str]], manual_draft_file: str | None) -> None:
+def attach_manual_drafts(rows: list[dict[str, Any]], manual_draft_file: str | None) -> None:
     if not manual_draft_file:
         return
     path = Path(manual_draft_file)
@@ -149,12 +308,13 @@ def diffusion_lm_rows() -> list[dict[str, Any]]:
     return rows
 
 
-def generate_gpt2(rows: list[dict[str, str]], args: argparse.Namespace) -> tuple[list[str], float]:
+def generate_gpt2(rows: list[dict[str, Any]], args: argparse.Namespace) -> tuple[list[str], float]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.gpt2_model, local_files_only=args.local_files_only)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(args.gpt2_model, local_files_only=args.local_files_only).to(device)
     model.eval()
     predictions = []
@@ -162,10 +322,11 @@ def generate_gpt2(rows: list[dict[str, str]], args: argparse.Namespace) -> tuple
     for offset in range(0, len(rows), args.batch_size):
         batch = rows[offset : offset + args.batch_size]
         inputs = tokenizer([row["prompt"] for row in batch], return_tensors="pt", padding=True, truncation=True).to(device)
+        max_new_tokens = max(int(row.get("target_len", args.max_seq_len - args.prompt_len)) for row in batch)
         with torch.no_grad():
             output = model.generate(
                 **inputs,
-                max_new_tokens=args.max_seq_len - args.prompt_len,
+                max_new_tokens=max_new_tokens,
                 do_sample=True,
                 top_k=50,
                 top_p=0.95,
@@ -185,12 +346,13 @@ def load_ours(args: argparse.Namespace):
     from transformers import BertTokenizer
 
     tokenizer = cached_from_pretrained(BertTokenizer)
+    inf.tokenizer = tokenizer
     models = inf.load_models(args.stage1, args.stage2)
     return inf, tokenizer, models
 
 
 def generate_ours(
-    rows: list[dict[str, str]],
+    rows: list[dict[str, Any]],
     args: argparse.Namespace,
     steps: int,
     latent_dim: int,
@@ -208,35 +370,61 @@ def generate_ours(
     inf, tokenizer, models = load_ours(args)
     encoder, decoder, flow_net, metric_net, start_prior, aux_token_head, aux_logit_fusion_beta, mlm_model = models
     predictions = []
+    original_prompt_len = inf.PROMPT_LEN
+    original_max_seq_len = inf.MAX_SEQ_LEN
+    original_mlm_draft_len = inf.MLM_DRAFT_LEN
     start = time.perf_counter()
-    for idx, row in enumerate(rows):
-        if args.draft_source == "manual":
-            draft = row["manual_draft"]
-            draft_status = "external/manual draft; demo mode, not autonomous generation"
-        else:
-            draft = corrupt_synthetic_draft(row["reference"], args.seed + idx)
-            draft_status = "synthetic corrupted target draft; controlled diagnostic"
-        debug = inf.generate(
-            row["prompt"],
-            flow_net,
-            metric_net,
-            encoder,
-            decoder,
-            mlm_model,
-            tokenizer,
-            n_samples=1,
-            seq_len=args.max_seq_len,
-            latent_dim=latent_dim,
-            steps=steps,
-            start_prior=start_prior,
-            aux_token_head=aux_token_head,
-            aux_logit_fusion_beta=aux_logit_fusion_beta,
-            draft_text=draft,
-            allow_latent_fallback=False,
-            return_debug=True,
-        )
-        output = debug["fused"][0] if debug["fused"] is not None else debug["flow"][0]
-        predictions.append(output)
+    try:
+        for idx, row in enumerate(rows):
+            if args.draft_source == "manual":
+                draft = row["manual_draft"]
+                draft_status = "external/manual draft; demo mode, not autonomous generation"
+            else:
+                draft = corrupt_synthetic_draft(row["reference"], args.seed + idx)
+                draft_status = "synthetic corrupted target draft; controlled diagnostic"
+
+            prompt_ids = tokenizer(
+                row["prompt"],
+                add_special_tokens=True,
+                truncation=True,
+                max_length=args.max_seq_len,
+            )["input_ids"]
+            dynamic_prompt_len = len(prompt_ids)
+            dynamic_prompt_len = max(1, min(dynamic_prompt_len, args.max_seq_len - 1))
+            dynamic_seq_len = min(
+                args.max_seq_len,
+                dynamic_prompt_len + int(row.get("target_len", args.max_seq_len - dynamic_prompt_len)),
+            )
+            dynamic_seq_len = max(dynamic_prompt_len + 1, dynamic_seq_len)
+            inf.PROMPT_LEN = dynamic_prompt_len
+            inf.MAX_SEQ_LEN = args.max_seq_len
+            inf.MLM_DRAFT_LEN = args.max_seq_len - dynamic_prompt_len
+
+            debug = inf.generate(
+                row["prompt"],
+                flow_net,
+                metric_net,
+                encoder,
+                decoder,
+                mlm_model,
+                tokenizer,
+                n_samples=1,
+                seq_len=dynamic_seq_len,
+                latent_dim=latent_dim,
+                steps=steps,
+                start_prior=start_prior,
+                aux_token_head=aux_token_head,
+                aux_logit_fusion_beta=aux_logit_fusion_beta,
+                draft_text=draft,
+                allow_latent_fallback=False,
+                return_debug=True,
+            )
+            output = debug["fused"][0] if debug["fused"] is not None else debug["flow"][0]
+            predictions.append(output)
+    finally:
+        inf.PROMPT_LEN = original_prompt_len
+        inf.MAX_SEQ_LEN = original_max_seq_len
+        inf.MLM_DRAFT_LEN = original_mlm_draft_len
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return predictions, time.perf_counter() - start, draft_status
@@ -245,7 +433,7 @@ def generate_ours(
 def add_metric_row(
     *,
     model: str,
-    rows: list[dict[str, str]],
+    rows: list[dict[str, Any]],
     predictions: list[str],
     latency: float,
     latent_dim: int | str,
@@ -294,7 +482,7 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
                 latent_dim="-",
                 steps="48 AR",
                 include_mauve=not args.no_mauve,
-                status="reproduced locally",
+                status=f"reproduced locally; split={args.split_strategy}",
             )
             gpt2_latency_per_sample = gpt2_row["latency_per_sample"]
             table_rows.append(gpt2_row)
@@ -356,7 +544,14 @@ def main() -> None:
     samples_path = out_dir / "generated_samples.jsonl"
     if samples_path.exists():
         samples_path.unlink()
-    rows = load_rocstories(args.num_samples, args.prompt_len, args.max_seq_len, args.local_files_only)
+    rows = load_rocstories(
+        args.num_samples,
+        args.prompt_len,
+        args.max_seq_len,
+        args.local_files_only,
+        args.rocstories_file,
+        args.split_strategy,
+    )
     attach_manual_drafts(rows, args.manual_draft_file)
 
     experiments = [args.experiment] if args.experiment != "all" else ["fair", "full", "latent_dim"]

@@ -11,10 +11,11 @@ from datasets import load_dataset
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"using: {device}")
 
-MAX_LENGTH = 64
-TRAIN_SIZE = 1000000
-TRAIN_BATCH_SIZE = 128
-EPOCHS = 3
+MAX_LENGTH = int(os.environ.get("MAX_SEQ_LEN", "64"))
+LATENT_DIM = int(os.environ.get("LATENT_DIM", "256"))
+TRAIN_SIZE = int(os.environ.get("TRAIN_SIZE", "1000000"))
+TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "128"))
+EPOCHS = int(os.environ.get("STAGE1_EPOCHS", "3"))
 DENOISE_LATENTS = True
 LATENT_NOISE_STD_FRAC = 0.05
 LATENT_NOISE_WARMUP_FRAC = 0.10
@@ -97,6 +98,16 @@ class ParallelDecoder(nn.Module):
 # ── Data ──────────────────────────────────────────────────────────────────────
 
 def build_dataloaders(tokenizer, train_size=1000000, batch_size=128, max_length=128):
+    try:
+        from stage2_config import DATASET_NAME
+        from stage2_data import build_stage2_dataloaders
+    except Exception:
+        DATASET_NAME = "wikitext"
+        build_stage2_dataloaders = None
+
+    if DATASET_NAME == "rocstories" and build_stage2_dataloaders is not None:
+        return build_stage2_dataloaders(tokenizer, train_size, batch_size, max_length)
+
     ds          = load_dataset("wikitext", "wikitext-103-raw-v1")
     small_train = ds["train"].select(range(train_size))
     small_val   = ds["validation"]
@@ -236,6 +247,10 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            checkpoint_path = os.environ.get(
+                "STAGE1_CHECKPOINT",
+                f"stage1_rocstories_{LATENT_DIM}_best.pt" if os.environ.get("SLTR_DATASET") == "rocstories" else "stage1_best.pt",
+            )
             atomic_torch_save({
                 "decoder": decoder.state_dict(),
                 "epoch":   epoch + 1,
@@ -247,9 +262,11 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 "latent_noise_min_mult": LATENT_NOISE_MIN_MULT,
                 "latent_std_ema": latent_std_ema.detach().item(),
                 "max_length": MAX_LENGTH,
+                "latent_dim": LATENT_DIM,
                 "train_size": TRAIN_SIZE,
-            }, "stage1_best.pt")
-            print(f"saved best model at val loss {best_val_loss:.4f}", flush=True)
+                "dataset_name": os.environ.get("SLTR_DATASET", "wikitext"),
+            }, checkpoint_path)
+            print(f"saved best model at val loss {best_val_loss:.4f} | path {checkpoint_path}", flush=True)
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -323,7 +340,7 @@ if __name__ == "__main__":
 
     tokenizer = cached_from_pretrained(BertTokenizer)
     encoder   = BertEncoder().to(device)
-    decoder   = ParallelDecoder(latent_dim=256).to(device)
+    decoder   = ParallelDecoder(latent_dim=LATENT_DIM).to(device)
 
     train_loader, val_loader = build_dataloaders(
         tokenizer,
@@ -333,7 +350,11 @@ if __name__ == "__main__":
     )
     train(encoder, decoder, train_loader, val_loader, device, epochs=EPOCHS)
 
-    best = torch.load("stage1_best.pt", map_location=device, weights_only=False)
+    checkpoint_path = os.environ.get(
+        "STAGE1_CHECKPOINT",
+        f"stage1_rocstories_{LATENT_DIM}_best.pt" if os.environ.get("SLTR_DATASET") == "rocstories" else "stage1_best.pt",
+    )
+    best = torch.load(checkpoint_path, map_location=device, weights_only=False)
     decoder.load_state_dict(best["decoder"])
     print(f"loaded best stage1 checkpoint | val_loss {best['val_loss']:.4f}")
 

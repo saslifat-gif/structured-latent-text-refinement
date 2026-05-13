@@ -23,6 +23,7 @@ from stage2_riemannian import (
     FlowNet,
     LatentProjector,
     MetricNet,
+    ResidualRefiner,
     StartMLP,
     StartTransformer,
     attention_gate_grad_stats,
@@ -122,12 +123,16 @@ if FAST_DEBUG:
 
 print(
     "stage2 config | "
+    f"dataset={DATASET_NAME} split={ROCSTORIES_SPLIT if DATASET_NAME == 'rocstories' else 'legacy'} "
+    f"prompt_slots={PROMPT_LEN} max_seq={MAX_SEQ_LEN} latent_dim={LATENT_DIM} "
     f"train_size={TRAIN_SIZE} batch={TRAIN_BATCH_SIZE} "
     f"flow={FLOW_HIDDEN_DIM}x{FLOW_DEPTH} refine_scale={FLOW_REFINE_SCALE} "
     f"target_frac={FLOW_REFINE_TARGET_FRACTION} vclamp={VELOCITY_CLAMP} "
-    f"metric={METRIC_HIDDEN_DIM} metric_frozen_steps={METRIC_FROZEN_STEPS} "
+    f"metric={METRIC_HIDDEN_DIM} metric_lr={METRIC_LR} metric_reg={METRIC_REG} "
+    f"metric_frozen_steps={METRIC_FROZEN_STEPS} metric_warmup={METRIC_WARMUP_STEPS}x{METRIC_WARMUP_REG_MULT} "
     f"flow_token_ce={ROLLOUT_FLOW_TOKEN_CE_WEIGHT}x{ROLLOUT_FLOW_TOKEN_CE_BATCH} "
     f"fused_ce={FUSED_TOKEN_CE_WEIGHT}x{FUSED_TOKEN_CE_BATCH} beta={AUX_LOGIT_FUSION_BETA} "
+    f"ot={OT_LOSS_WEIGHT}x{OT_MAX_TOKENS} blur={OT_BLUR} "
     f"structured_start={STRUCTURED_TARGET_START} alpha={STRUCTURED_START_ALPHA} "
     f"start_mlp={START_MLP} start_transformer={START_TRANSFORMER} "
     f"denoising_prior={DENOISING_PRIOR} dp_alpha={DENOISING_PRIOR_ALPHA} dp_frozen={DENOISING_PRIOR_FROZEN} "
@@ -136,15 +141,20 @@ print(
     f"aux_token={AUX_TOKEN_CE_WEIGHT} shared_block={TOKEN_SHARED_BLOCK}x{TOKEN_SHARED_BLOCK_SCALE} "
     f"token_residual={TOKEN_RESIDUAL_SCALE} "
     f"projector={LATENT_PROJECTOR} projector_only={LATENT_PROJECTOR_ONLY} reset={LATENT_PROJECTOR_RESET} "
+    f"residual_refiner={RESIDUAL_REFINER} scale={RESIDUAL_SCALE} "
     f"decoder_flow_joint={DECODER_FLOW_JOINT} decoder_generated_adapt_only={DECODER_GENERATED_ADAPT_ONLY} "
     f"compile={COMPILE_MODELS} fast_debug={FAST_DEBUG}",
     flush=True,
 )
 
 encoder = BertEncoder().to(device)
-decoder = ParallelDecoder(latent_dim=256).to(device)
+decoder = ParallelDecoder(latent_dim=LATENT_DIM).to(device)
 
-checkpoint = torch.load("stage1_best.pt", map_location=device, weights_only=False)
+STAGE1_CHECKPOINT = os.environ.get(
+    "STAGE1_CHECKPOINT",
+    f"stage1_rocstories_{LATENT_DIM}_best.pt" if DATASET_NAME == "rocstories" else "stage1_best.pt",
+)
+checkpoint = torch.load(STAGE1_CHECKPOINT, map_location=device, weights_only=False)
 decoder.load_state_dict(checkpoint["decoder"])
 if "encoder" in checkpoint:
     encoder.load_state_dict(checkpoint["encoder"])
@@ -158,7 +168,7 @@ if DECODER_ADAPT:
 decoder_adapt_params, decoder_adapt_bert_params = configure_decoder_adaptation(decoder)
 encoder.eval()
 print(
-    "stage1 loaded | encoder frozen | "
+    f"stage1 loaded from {STAGE1_CHECKPOINT} | encoder frozen | "
     f"decoder_adapt={DECODER_ADAPT}",
     flush=True,
 )
@@ -171,12 +181,12 @@ train_loader, val_loader = build_stage2_dataloaders(
     max_length=MAX_SEQ_LEN,
 )
 
-flow_net = FlowNet(latent_dim=256, hidden_dim=FLOW_HIDDEN_DIM, depth=FLOW_DEPTH).to(device)
-metric_net = MetricNet(latent_dim=256, hidden_dim=METRIC_HIDDEN_DIM).to(device)
+flow_net = FlowNet(latent_dim=LATENT_DIM, hidden_dim=FLOW_HIDDEN_DIM, depth=FLOW_DEPTH).to(device)
+metric_net = MetricNet(latent_dim=LATENT_DIM, hidden_dim=METRIC_HIDDEN_DIM).to(device)
 if DENOISING_PRIOR:
     _dp_ckpt = torch.load(DENOISING_PRIOR_PATH, map_location=device, weights_only=False)
     _dp = DenoisingPrior(
-        latent_dim=256,
+        latent_dim=_dp_ckpt.get("latent_dim", LATENT_DIM),
         hidden_dim=_dp_ckpt.get("denoising_hidden_dim", START_TRANSFORMER_HIDDEN_DIM),
         num_layers=_dp_ckpt.get("denoising_layers", START_TRANSFORMER_LAYERS),
         num_heads=_dp_ckpt.get("denoising_heads", START_TRANSFORMER_HEADS),
@@ -186,11 +196,11 @@ if DENOISING_PRIOR:
         freeze_module(_dp)
     if DRAFT_PRIOR:
         start_mlp = DraftPriorSampler(
-            _dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA,
+            _dp, latent_dim=LATENT_DIM, alpha=DENOISING_PRIOR_ALPHA,
         ).to(device)
     else:
         start_mlp = DenoisingPriorSampler(
-            _dp, latent_dim=256, alpha=DENOISING_PRIOR_ALPHA,
+            _dp, latent_dim=LATENT_DIM, alpha=DENOISING_PRIOR_ALPHA,
             use_oracle=DENOISING_PRIOR_ORACLE_ZT,
         ).to(device)
     print(
@@ -201,13 +211,13 @@ if DENOISING_PRIOR:
     )
 elif START_TRANSFORMER:
     start_mlp = StartTransformer(
-        latent_dim=256,
+        latent_dim=LATENT_DIM,
         num_layers=START_TRANSFORMER_LAYERS,
         num_heads=START_TRANSFORMER_HEADS,
         ffn_dim=START_TRANSFORMER_HIDDEN_DIM,
     ).to(device)
 elif START_MLP:
-    start_mlp = StartMLP(latent_dim=256, hidden_dim=START_MLP_HIDDEN_DIM).to(device)
+    start_mlp = StartMLP(latent_dim=LATENT_DIM, hidden_dim=START_MLP_HIDDEN_DIM).to(device)
 else:
     start_mlp = None
 aux_token_head = (
@@ -217,12 +227,22 @@ aux_token_head = (
 )
 latent_projector = (
     LatentProjector(
-        latent_dim=256,
+        latent_dim=LATENT_DIM,
         hidden_dim=LATENT_PROJECTOR_HIDDEN_DIM,
         depth=LATENT_PROJECTOR_DEPTH,
         residual_scale=LATENT_PROJECTOR_RES_SCALE,
     ).to(device)
     if LATENT_PROJECTOR
+    else None
+)
+residual_refiner = (
+    ResidualRefiner(
+        latent_dim=LATENT_DIM,
+        hidden_dim=RESIDUAL_REFINER_HIDDEN_DIM,
+        depth=RESIDUAL_REFINER_DEPTH,
+        residual_scale=RESIDUAL_SCALE,
+    ).to(device)
+    if RESIDUAL_REFINER
     else None
 )
 
@@ -238,7 +258,7 @@ if (LATENT_PROJECTOR and LATENT_PROJECTOR_ONLY) or DECODER_GENERATED_ADAPT_ONLY:
 optimizer = AdamW([
     {"params": non_gate_flow_parameters(flow_net), "lr": 1e-4},
     {"params": attention_gate_parameters(flow_net), "lr": 1e-4 * GATE_LR_MULT},
-    {"params": metric_net.parameters(), "lr": 5e-5},
+    {"params": metric_net.parameters(), "lr": METRIC_LR},
     *([{"params": [p for p in start_mlp.parameters() if p.requires_grad], "lr": START_TRANSFORMER_LR if START_TRANSFORMER else START_MLP_LR}] if start_mlp is not None and any(p.requires_grad for p in start_mlp.parameters()) else []),
     *([{"params": aux_token_head.parameters(), "lr": 1e-4}] if aux_token_head is not None else []),
 ] + (
@@ -253,6 +273,10 @@ optimizer = AdamW([
     [{"params": latent_projector.parameters(), "lr": LATENT_PROJECTOR_LR}]
     if latent_projector is not None
     else []
+) + (
+    [{"params": residual_refiner.parameters(), "lr": RESIDUAL_REFINER_LR}]
+    if residual_refiner is not None
+    else []
 ))
 projector_param_count = (
     sum(p.numel() for p in latent_projector.parameters() if p.requires_grad)
@@ -262,6 +286,11 @@ projector_param_count = (
 aux_param_count = (
     sum(p.numel() for p in aux_token_head.parameters() if p.requires_grad)
     if aux_token_head is not None
+    else 0
+)
+residual_param_count = (
+    sum(p.numel() for p in residual_refiner.parameters() if p.requires_grad)
+    if residual_refiner is not None
     else 0
 )
 start_param_count = (
@@ -279,6 +308,7 @@ print(
     f"optimizer params | projector_trainable={projector_param_count} "
     f"start_trainable={start_param_count} "
     f"aux_trainable={aux_param_count} "
+    f"residual_trainable={residual_param_count} "
     f"optimizer_trainable={optimizer_param_count}",
     flush=True,
 )
@@ -343,6 +373,8 @@ checkpoint_path = (
     if DECODER_ADAPT
     else "stage2_conditional_best.pt"
 )
+if DATASET_NAME == "rocstories":
+    checkpoint_path = checkpoint_path.replace(".pt", f"_rocstories_{LATENT_DIM}.pt")
 
 if RESUME:
     loaded_checkpoint_path = (
@@ -448,6 +480,8 @@ for epoch in range(EPOCHS):
             start_mlp.train()
         if latent_projector is not None:
             latent_projector.train()
+        if residual_refiner is not None:
+            residual_refiner.train()
     else:
         flow_net.train()
         if aux_token_head is not None:
@@ -507,6 +541,7 @@ for epoch in range(EPOCHS):
                 teacher_decoder=teacher_decoder,
                 start_mlp=start_mlp,
                 latent_projector=latent_projector,
+                residual_refiner=residual_refiner,
                 z_draft_start=z_draft_start,
                 return_stats=True,
                 global_step=global_step,
@@ -539,6 +574,7 @@ for epoch in range(EPOCHS):
                 + decoder_adapt_params
                 + decoder_adapt_bert_params
                 + (list(latent_projector.parameters()) if latent_projector is not None else [])
+                + (list(residual_refiner.parameters()) if residual_refiner is not None else [])
             ),
             max_norm=1.0,
         )
@@ -588,6 +624,10 @@ for epoch in range(EPOCHS):
                 f" | rdiv {stats['rollout_diversity_loss']:.4f}*{ROLLOUT_DIVERSITY_LOSS_WEIGHT:.3f}={stats['weighted_rollout_diversity_loss']:.4f}"
                 f" | rcos {stats['rollout_cosine_loss']:.4f}*{ROLLOUT_COSINE_LOSS_WEIGHT:.3f}={stats['weighted_rollout_cosine_loss']:.4f}"
                 f" cos={stats['rollout_cosine']:.3f}"
+                f" | ot {stats['ot_loss']:.4f}*{OT_LOSS_WEIGHT:.3f}={stats['weighted_ot_loss']:.4f}"
+                f" {stats['ot_backend']}"
+                f" | res dnorm={stats['residual_delta_norm']:.6f}"
+                f" dabs={stats['residual_delta_abs_mean']:.6f}/{stats['residual_delta_abs_max']:.6f}"
                 f" | pmse {stats['projector_mse_loss']:.4f}*{LATENT_PROJECTOR_MSE_WEIGHT:.3f}={stats['weighted_projector_mse_loss']:.4f}"
                 f" | pcos {stats['projector_cosine_loss']:.4f}*{LATENT_PROJECTOR_COSINE_WEIGHT:.3f}={stats['weighted_projector_cosine_loss']:.4f}"
                 f" cos={stats['projector_cosine']:.3f}"
@@ -626,6 +666,7 @@ for epoch in range(EPOCHS):
         start_mlp=start_mlp,
         aux_token_head=aux_token_head,
         latent_projector=latent_projector,
+        residual_refiner=residual_refiner,
         draft_start_fn=make_stage2_draft_latents if DRAFT_PRIOR else None,
     )
 
@@ -639,6 +680,7 @@ for epoch in range(EPOCHS):
             "encoder": encoder.state_dict(),
             "decoder": decoder.state_dict(),
             "latent_projector": latent_projector.state_dict() if latent_projector is not None else None,
+            "residual_refiner": residual_refiner.state_dict() if residual_refiner is not None else None,
             "best_loss": avg_val_loss,
             "best_score": best_score,
             "metric_loss_weight": METRIC_LOSS_WEIGHT,
@@ -675,6 +717,10 @@ for epoch in range(EPOCHS):
             "rollout_norm_loss_weight": ROLLOUT_NORM_LOSS_WEIGHT,
             "rollout_diversity_loss_weight": ROLLOUT_DIVERSITY_LOSS_WEIGHT,
             "rollout_cosine_loss_weight": ROLLOUT_COSINE_LOSS_WEIGHT,
+            "ot_loss_weight": OT_LOSS_WEIGHT,
+            "ot_max_tokens": OT_MAX_TOKENS,
+            "ot_blur": OT_BLUR,
+            "ot_projections": OT_PROJECTIONS,
             "rollout_diversity_max_tokens": ROLLOUT_DIVERSITY_MAX_TOKENS,
             "rollout_batch": ROLLOUT_BATCH,
             "rollout_train_steps": ROLLOUT_TRAIN_STEPS,
@@ -717,6 +763,11 @@ for epoch in range(EPOCHS):
             "latent_projector_cosine_weight": LATENT_PROJECTOR_COSINE_WEIGHT,
             "latent_projector_token_ce_weight": LATENT_PROJECTOR_TOKEN_CE_WEIGHT,
             "latent_projector_delta_reg_weight": LATENT_PROJECTOR_DELTA_REG_WEIGHT,
+            "residual_refiner": RESIDUAL_REFINER,
+            "residual_scale": RESIDUAL_SCALE,
+            "residual_refiner_hidden_dim": RESIDUAL_REFINER_HIDDEN_DIM,
+            "residual_refiner_depth": RESIDUAL_REFINER_DEPTH,
+            "residual_refiner_lr": RESIDUAL_REFINER_LR,
             "raw_norm_gap_score_weight": RAW_NORM_GAP_SCORE_WEIGHT,
             "collapse_uniq_target": COLLAPSE_UNIQ_TARGET,
             "collapse_maxfrac_target": COLLAPSE_MAXFRAC_TARGET,
@@ -736,6 +787,7 @@ for epoch in range(EPOCHS):
             "decoder_adapt_kl_temp": DECODER_ADAPT_KL_TEMP,
             "decoder_adapt_modules": DECODER_ADAPT_MODULES,
             "metric_reg": METRIC_REG,
+            "metric_lr": METRIC_LR,
             "metric_warmup_reg_mult": METRIC_WARMUP_REG_MULT,
             "metric_warmup_steps": METRIC_WARMUP_STEPS,
             "metric_log_bound": METRIC_LOG_BOUND,
@@ -746,6 +798,10 @@ for epoch in range(EPOCHS):
             "gate_reg_weight": GATE_REG_WEIGHT,
             "gate_lr_mult": GATE_LR_MULT,
             "max_seq_len": MAX_SEQ_LEN,
+            "prompt_len": PROMPT_LEN,
+            "latent_dim": LATENT_DIM,
+            "dataset_name": DATASET_NAME,
+            "dataset_split": ROCSTORIES_SPLIT if DATASET_NAME == "rocstories" else "legacy_fixed_token",
             "base_noise_std": BASE_NOISE_STD,
             "calibrate_generated_latents": CALIBRATE_GENERATED_LATENTS,
             "target_latent_mean": TARGET_LATENT_MEAN,

@@ -12,10 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
 from stage2_config import (
+    DATASET_NAME,
     DECODE_LOSS_BATCH,
     EPOCHS,
     FLOW_DEPTH,
     FLOW_HIDDEN_DIM,
+    LATENT_DIM,
     LOG_EVERY,
     MAX_SEQ_LEN,
     METRIC_HIDDEN_DIM,
@@ -29,6 +31,7 @@ from stage2_config import (
     TRAIN_BATCH_SIZE,
     TRAIN_SIZE,
     AUX_LOGIT_FUSION_BETA,
+    ROCSTORIES_SPLIT,
 )
 from stage2_data import build_stage2_dataloaders
 from stage2_losses import rollout_cosine_alignment_loss, rollout_flow_token_ce_loss
@@ -39,9 +42,11 @@ from stage2_riemannian import AuxTokenHead, DenoisingPrior, FlowNet, MetricNet, 
 DRAFT_ALPHA = 0.7
 DRAFT_CURRICULUM = (
     (0, 0.00, 0.00),  # epochs 1-2: exact target draft
-    (2, 0.05, 0.00),  # epochs 3-4: slightly damaged target draft
-    (4, 0.05, 0.00),  # epochs 5+: hold the useful 95% real draft band
+    (2, 0.03, 0.00),  # epochs 3-5: gentle 3% dropout
+    (5, 0.05, 0.00),  # epoch 6: useful 5% dropout checkpoint
+    (6, 0.10, 0.00),  # epochs 7-10: harder 10% dropout
 )
+EPOCHS = int(os.environ.get("DRAFT_PRIOR_EPOCHS", "10"))
 DRAFT_LR = 3e-5
 DRAFT_LAYERS = 4
 DRAFT_HEADS = 8
@@ -51,8 +56,12 @@ DRAFT_MSE_WEIGHT = 0.05
 DRAFT_COS_WEIGHT = 0.05
 DRAFT_NORM_WEIGHT = 0.01
 DRAFT_CE_BATCH = 64
-CHECKPOINT_PATH = "draft_prior_best.pt"
+CHECKPOINT_PATH = os.environ.get(
+    "DRAFT_PRIOR_CHECKPOINT",
+    f"draft_prior_rocstories_{LATENT_DIM}_best.pt" if DATASET_NAME == "rocstories" else "draft_prior_best.pt",
+)
 RESUME = False
+CHECKPOINT_PREFIX = f"draft_prior_rocstories_{LATENT_DIM}" if DATASET_NAME == "rocstories" else "draft_prior"
 
 STAGE2_EVAL_PATH = os.environ.get("DRAFT_PRIOR_STAGE2", "")
 SAVE_EXAMPLES_PATH = "draft_prior_examples.txt"
@@ -69,7 +78,9 @@ random.seed(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(
-    f"draft-prior config | alpha={DRAFT_ALPHA} curriculum={DRAFT_CURRICULUM} "
+    f"draft-prior config | dataset={DATASET_NAME} split={ROCSTORIES_SPLIT if DATASET_NAME == 'rocstories' else 'legacy'} "
+    f"prompt_slots={PROMPT_LEN} max_seq={MAX_SEQ_LEN} latent_dim={LATENT_DIM} "
+    f"alpha={DRAFT_ALPHA} curriculum={DRAFT_CURRICULUM} "
     f"layers={DRAFT_LAYERS} heads={DRAFT_HEADS} hidden={DRAFT_HIDDEN_DIM} lr={DRAFT_LR} | "
     f"loss ce={DRAFT_CE_WEIGHT} mse={DRAFT_MSE_WEIGHT} cos={DRAFT_COS_WEIGHT} norm={DRAFT_NORM_WEIGHT}",
     flush=True,
@@ -77,9 +88,13 @@ print(
 
 
 encoder = BertEncoder().to(device)
-decoder = ParallelDecoder(latent_dim=256).to(device)
+decoder = ParallelDecoder(latent_dim=LATENT_DIM).to(device)
 
-ckpt1 = torch.load("stage1_best.pt", map_location=device, weights_only=False)
+STAGE1_CHECKPOINT = os.environ.get(
+    "STAGE1_CHECKPOINT",
+    f"stage1_rocstories_{LATENT_DIM}_best.pt" if DATASET_NAME == "rocstories" else "stage1_best.pt",
+)
+ckpt1 = torch.load(STAGE1_CHECKPOINT, map_location=device, weights_only=False)
 decoder.load_state_dict(ckpt1["decoder"])
 if "encoder" in ckpt1:
     encoder.load_state_dict(ckpt1["encoder"])
@@ -90,7 +105,7 @@ for p in decoder.parameters():
     p.requires_grad = False
 encoder.eval()
 decoder.eval()
-print("stage1 loaded | encoder + decoder frozen", flush=True)
+print(f"stage1 loaded from {STAGE1_CHECKPOINT} | encoder + decoder frozen", flush=True)
 
 
 tokenizer = cached_from_pretrained(BertTokenizer)
@@ -119,7 +134,7 @@ PUNCT_TOKENS = {".", ",", ";", ":", "!", "?", "-", "(", ")", "'", '"'}
 
 
 model = DenoisingPrior(
-    latent_dim=256,
+    latent_dim=LATENT_DIM,
     hidden_dim=DRAFT_HIDDEN_DIM,
     num_layers=DRAFT_LAYERS,
     num_heads=DRAFT_HEADS,
@@ -128,12 +143,14 @@ model = DenoisingPrior(
 optimizer = AdamW(model.parameters(), lr=DRAFT_LR)
 scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 best_val_score = float("inf")
+best_scores_by_corruption = {}
 
 if RESUME and os.path.exists(CHECKPOINT_PATH):
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
     state = ckpt.get("draft_prior", ckpt.get("denoising_prior"))
     model.load_state_dict(state)
     best_val_score = ckpt.get("best_val_score", float("inf"))
+    best_scores_by_corruption = ckpt.get("best_scores_by_corruption", {})
     print(f"resumed from {CHECKPOINT_PATH} | best_val_score={best_val_score:.4f}", flush=True)
 else:
     print("training draft prior from scratch", flush=True)
@@ -158,6 +175,51 @@ def draft_corruption_for_epoch(epoch):
         if epoch >= start_epoch:
             drop_prob, replace_prob = sched_drop, sched_replace
     return drop_prob, replace_prob
+
+
+def corruption_tag(drop_prob):
+    pct = int(round(drop_prob * 100))
+    return "clean" if pct == 0 else f"drop{pct:02d}"
+
+
+def corruption_checkpoint_path(drop_prob):
+    return f"{CHECKPOINT_PREFIX}_{corruption_tag(drop_prob)}_best.pt"
+
+
+def checkpoint_payload(epoch, drop_prob, replace_prob, val_ce, val_p, val_top1, val_mse, val_cos, val_norm, score):
+    quality_score = val_ce - 2.0 * val_p - val_top1
+    return {
+        "draft_prior": model.state_dict(),
+        "denoising_prior": model.state_dict(),
+        "best_val_score": score,
+        "val_prior_ce": val_ce,
+        "val_prior_p": val_p,
+        "val_prior_top1": val_top1,
+        "val_prior_mse": val_mse,
+        "val_prior_cos": val_cos,
+        "val_prior_norm": val_norm,
+        "checkpoint_score": score,
+        "checkpoint_score_formula": "val_ce",
+        "quality_score_ce_minus_2p_minus_top1": quality_score,
+        "validation_drop_prob": drop_prob,
+        "validation_replace_prob": replace_prob,
+        "corruption_tag": corruption_tag(drop_prob),
+        "draft_alpha": DRAFT_ALPHA,
+        "draft_drop_prob": drop_prob,
+        "draft_replace_prob": replace_prob,
+        "draft_curriculum": DRAFT_CURRICULUM,
+        "denoising_layers": DRAFT_LAYERS,
+        "denoising_heads": DRAFT_HEADS,
+        "denoising_hidden_dim": DRAFT_HIDDEN_DIM,
+        "latent_dim": LATENT_DIM,
+        "prompt_len": PROMPT_LEN,
+        "max_seq_len": MAX_SEQ_LEN,
+        "dataset_name": DATASET_NAME,
+        "dataset_split": ROCSTORIES_SPLIT if DATASET_NAME == "rocstories" else "legacy_fixed_token",
+        "epoch": epoch,
+        "type": "draft_prior",
+        "best_scores_by_corruption": dict(best_scores_by_corruption),
+    }
 
 
 def make_synthetic_draft_ids(input_ids, attention_mask, drop_prob, replace_prob):
@@ -302,12 +364,12 @@ def load_stage2_flow():
 
     ckpt = torch.load(STAGE2_EVAL_PATH, map_location=device, weights_only=False)
     flow_net = FlowNet(
-        latent_dim=256,
+        latent_dim=LATENT_DIM,
         hidden_dim=ckpt.get("flow_hidden_dim", FLOW_HIDDEN_DIM),
         depth=ckpt.get("flow_depth", FLOW_DEPTH),
     ).to(device)
     metric_net = MetricNet(
-        latent_dim=256,
+        latent_dim=LATENT_DIM,
         hidden_dim=ckpt.get("metric_hidden_dim", METRIC_HIDDEN_DIM),
         log_bound=ckpt.get("metric_log_bound", METRIC_LOG_BOUND),
     ).to(device)
@@ -553,31 +615,41 @@ for epoch in range(EPOCHS):
     print(msg, flush=True)
 
     save_score = val_ce
+    tag = corruption_tag(drop_prob)
+    level_best = best_scores_by_corruption.get(tag, float("inf"))
+    payload = checkpoint_payload(
+        epoch,
+        drop_prob,
+        replace_prob,
+        val_ce,
+        val_p,
+        val_top1,
+        val_mse,
+        val_cos,
+        val_norm,
+        save_score,
+    )
+    if save_score < level_best:
+        best_scores_by_corruption[tag] = save_score
+        payload["best_scores_by_corruption"] = dict(best_scores_by_corruption)
+        level_path = corruption_checkpoint_path(drop_prob)
+        torch.save(payload, level_path)
+        print(
+            f"saved {level_path} | corruption={tag} drop={drop_prob:.2f} "
+            f"score={save_score:.4f} ce={val_ce:.3f} p={val_p:.3f} top1={val_top1:.3f}",
+            flush=True,
+        )
+
     if save_score < best_val_score:
         best_val_score = save_score
-        torch.save(
-            {
-                "draft_prior": model.state_dict(),
-                "denoising_prior": model.state_dict(),
-                "best_val_score": best_val_score,
-                "val_prior_ce": val_ce,
-                "val_prior_p": val_p,
-                "val_prior_top1": val_top1,
-                "draft_alpha": DRAFT_ALPHA,
-                "draft_drop_prob": drop_prob,
-                "draft_replace_prob": replace_prob,
-                "draft_curriculum": DRAFT_CURRICULUM,
-                "denoising_layers": DRAFT_LAYERS,
-                "denoising_heads": DRAFT_HEADS,
-                "denoising_hidden_dim": DRAFT_HIDDEN_DIM,
-                "prompt_len": PROMPT_LEN,
-                "max_seq_len": MAX_SEQ_LEN,
-                "epoch": epoch,
-                "type": "draft_prior",
-            },
-            CHECKPOINT_PATH,
+        payload["best_val_score"] = best_val_score
+        payload["best_scores_by_corruption"] = dict(best_scores_by_corruption)
+        torch.save(payload, CHECKPOINT_PATH)
+        print(
+            f"saved compatibility checkpoint {CHECKPOINT_PATH} | overall_best={best_val_score:.4f} "
+            f"| corruption={tag}",
+            flush=True,
         )
-        print(f"saved {CHECKPOINT_PATH} | best_val_score={best_val_score:.4f}", flush=True)
 
     if EXAMPLE_EVERY_EPOCH:
         write_examples(epoch, flow_eval, metric_eval, aux_eval, fusion_beta_eval)

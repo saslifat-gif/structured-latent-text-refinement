@@ -11,6 +11,9 @@ from stage2_riemannian import (
     suffix_positions,
 )
 
+_SINKHORN_LOSS = None
+_SINKHORN_IMPORT_ATTEMPTED = False
+
 
 def flatten_valid(z_target, z_t, v_true, v_pred, z_x0, z_cond, pos, t, target_mask):
     B, T, D = z_target.shape
@@ -58,6 +61,43 @@ def pairwise_distance_match_loss(z_pred, z_target, mask=None, max_tokens=ROLLOUT
     target_dist = torch.pdist(target_tokens.detach().float(), p=2)
     scale = target_dist.mean().clamp_min(eps)
     return F.smooth_l1_loss(pred_dist / scale, target_dist / scale)
+
+
+def ot_latent_distribution_loss(z_pred, z_target, mask=None, max_tokens=OT_MAX_TOKENS):
+    pred_tokens = valid_token_latents(z_pred, mask).float()
+    target_tokens = valid_token_latents(z_target, mask).detach().float()
+    n_tokens = min(pred_tokens.size(0), target_tokens.size(0))
+    if n_tokens < 2:
+        return z_pred.new_tensor(0.0), "none"
+    pred_tokens = pred_tokens[:n_tokens]
+    target_tokens = target_tokens[:n_tokens]
+    if n_tokens > max_tokens:
+        sample_idx = torch.randperm(n_tokens, device=z_pred.device)[:max_tokens]
+        pred_tokens = pred_tokens[sample_idx]
+        target_tokens = target_tokens[sample_idx]
+
+    global _SINKHORN_LOSS, _SINKHORN_IMPORT_ATTEMPTED
+    if not _SINKHORN_IMPORT_ATTEMPTED:
+        _SINKHORN_IMPORT_ATTEMPTED = True
+        try:
+            from geomloss import SamplesLoss
+
+            _SINKHORN_LOSS = SamplesLoss("sinkhorn", p=2, blur=OT_BLUR)
+        except Exception:
+            _SINKHORN_LOSS = None
+
+    if _SINKHORN_LOSS is not None:
+        return _SINKHORN_LOSS(pred_tokens, target_tokens), "sinkhorn"
+
+    # Lightweight fallback: sliced Wasserstein over random projections.
+    n_proj = max(1, OT_PROJECTIONS)
+    dirs = torch.randn(pred_tokens.size(-1), n_proj, device=pred_tokens.device, dtype=pred_tokens.dtype)
+    dirs = F.normalize(dirs, dim=0)
+    pred_proj = pred_tokens @ dirs
+    target_proj = target_tokens @ dirs
+    pred_sorted = pred_proj.sort(dim=0).values
+    target_sorted = target_proj.sort(dim=0).values
+    return F.mse_loss(pred_sorted, target_sorted), "sliced"
 
 
 def rollout_cosine_alignment_loss(z_pred, z_target, mask=None):
@@ -236,6 +276,7 @@ def flow_matching_loss(
     teacher_decoder=None,
     start_mlp=None,
     latent_projector=None,
+    residual_refiner=None,
     z_draft_start=None,
     global_step=None,
     steps_per_epoch=None,
@@ -306,6 +347,12 @@ def flow_matching_loss(
                     "rollout_cosine_loss": 0.0,
                     "weighted_rollout_cosine_loss": 0.0,
                     "rollout_cosine": 0.0,
+                    "ot_loss": 0.0,
+                    "weighted_ot_loss": 0.0,
+                    "ot_backend": "none",
+                    "residual_delta_norm": 0.0,
+                    "residual_delta_abs_mean": 0.0,
+                    "residual_delta_abs_max": 0.0,
                     "projector_mse_loss": 0.0,
                     "weighted_projector_mse_loss": 0.0,
                     "projector_cosine_loss": 0.0,
@@ -388,6 +435,19 @@ def flow_matching_loss(
         v_pred = flow_net(z_t, t_seq, z_cond, pos_seq, target_mask)
         aux_hidden = None
     z_x0 = z_t + FLOW_REFINE_SCALE * (1.0 - t_seq.unsqueeze(-1)) * v_pred
+    residual_delta_norm = 0.0
+    residual_delta_abs_mean = 0.0
+    residual_delta_abs_max = 0.0
+    if residual_refiner is not None and z_prompt is not None:
+        z_x0, residual_delta = residual_refiner(z_x0, z_prompt, pos_seq, target_mask)
+        if target_mask is not None and target_mask.bool().any():
+            residual_valid = residual_delta[target_mask.bool()]
+        else:
+            residual_valid = residual_delta.reshape(-1, residual_delta.size(-1))
+        if residual_valid.numel() > 0:
+            residual_delta_norm = residual_valid.detach().norm(dim=-1).mean().item()
+            residual_delta_abs_mean = residual_valid.detach().abs().mean().item()
+            residual_delta_abs_max = residual_valid.detach().abs().max().item()
 
     z_flat, z_t_flat, v_true_flat, v_pred_flat, z_x0_flat, cond_flat, pos_flat, t_flat = flatten_valid(
         z_target,
@@ -406,6 +466,11 @@ def flow_matching_loss(
     metric_loss = (g_diag * err).mean(dim=-1).mean()
     euclidean_loss = err.mean()
     x0_loss = F.mse_loss(z_x0_flat, z_flat)
+    if OT_LOSS_WEIGHT > 0:
+        ot_loss, ot_backend = ot_latent_distribution_loss(z_x0, z_target, target_mask)
+    else:
+        ot_loss = z_target.new_tensor(0.0)
+        ot_backend = "disabled"
     if global_step is None or METRIC_WARMUP_STEPS <= 0:
         metric_reg_mult = 1.0
     else:
@@ -543,6 +608,17 @@ def flow_matching_loss(
             z_roll = z_roll + FLOW_REFINE_SCALE * v_roll * dt
             if roll_mask is not None:
                 z_roll = z_roll * roll_mask.to(z_roll.dtype).unsqueeze(-1)
+
+        if residual_refiner is not None and z_prompt is not None:
+            z_roll, roll_residual_delta = residual_refiner(z_roll, z_prompt[:n_rollout], pos_roll, roll_mask)
+            if roll_mask is not None and roll_mask.bool().any():
+                roll_residual_valid = roll_residual_delta[roll_mask.bool()]
+            else:
+                roll_residual_valid = roll_residual_delta.reshape(-1, roll_residual_delta.size(-1))
+            if roll_residual_valid.numel() > 0:
+                residual_delta_norm = roll_residual_valid.detach().norm(dim=-1).mean().item()
+                residual_delta_abs_mean = roll_residual_valid.detach().abs().mean().item()
+                residual_delta_abs_max = roll_residual_valid.detach().abs().max().item()
 
         if roll_mask is not None:
             valid_roll = roll_mask.bool()
@@ -778,6 +854,7 @@ def flow_matching_loss(
         + ROLLOUT_NORM_LOSS_WEIGHT * rollout_norm_loss
         + ROLLOUT_DIVERSITY_LOSS_WEIGHT * rollout_diversity_loss
         + ROLLOUT_COSINE_LOSS_WEIGHT * rollout_cosine_loss
+        + OT_LOSS_WEIGHT * ot_loss
         + LATENT_PROJECTOR_MSE_WEIGHT * projector_mse_loss
         + LATENT_PROJECTOR_COSINE_WEIGHT * projector_cosine_loss
         + LATENT_PROJECTOR_TOKEN_CE_WEIGHT * projector_token_ce
@@ -847,6 +924,12 @@ def flow_matching_loss(
             "rollout_cosine_loss": rollout_cosine_loss.detach().item(),
             "weighted_rollout_cosine_loss": (ROLLOUT_COSINE_LOSS_WEIGHT * rollout_cosine_loss).detach().item(),
             "rollout_cosine": rollout_cosine,
+            "ot_loss": ot_loss.detach().item(),
+            "weighted_ot_loss": (OT_LOSS_WEIGHT * ot_loss).detach().item(),
+            "ot_backend": ot_backend,
+            "residual_delta_norm": residual_delta_norm,
+            "residual_delta_abs_mean": residual_delta_abs_mean,
+            "residual_delta_abs_max": residual_delta_abs_max,
             "projector_mse_loss": projector_mse_loss.detach().item(),
             "weighted_projector_mse_loss": (LATENT_PROJECTOR_MSE_WEIGHT * projector_mse_loss).detach().item(),
             "projector_cosine_loss": projector_cosine_loss.detach().item(),
