@@ -1,10 +1,53 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
-*.pt
-*.tmp
-*.log
-.DS_Store
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Packaging/build artifacts
 build/
 dist/
 *.egg-info/
+
+# Local environment and editor files
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+tmp/
+temp/
+
+# Model/checkpoint artifacts
+model/
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated experiment outputs
+results/**
+!results/
+!results/**/
+!results/**/.gitkeep
+runs/
+wandb/
+mlruns/
+
+# Generated examples
+examples/generated_samples*.jsonl
