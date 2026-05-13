@@ -48,6 +48,3 @@ results/**
 runs/
 wandb/
 mlruns/
-
-# Generated examples
-examples/generated_samples*.jsonl
