@@ -434,7 +434,15 @@ def flow_matching_loss(
     else:
         v_pred = flow_net(z_t, t_seq, z_cond, pos_seq, target_mask)
         aux_hidden = None
-    z_x0 = z_t + FLOW_REFINE_SCALE * (1.0 - t_seq.unsqueeze(-1)) * v_pred
+    pooled_cond_full = z_cond.mean(dim=1).unsqueeze(1).expand(-1, T, -1)
+    g_full = metric_net(
+        z_t.reshape(-1, D),
+        t_seq.reshape(-1),
+        pooled_cond_full.reshape(-1, D),
+        pos_seq.reshape(-1),
+    ).reshape_as(z_t)
+    v_nat_pred = v_pred / g_full.clamp_min(1e-3)
+    z_x0 = z_t + FLOW_REFINE_SCALE * (1.0 - t_seq.unsqueeze(-1)) * v_nat_pred
     residual_delta_norm = 0.0
     residual_delta_abs_mean = 0.0
     residual_delta_abs_max = 0.0
@@ -461,10 +469,13 @@ def flow_matching_loss(
         target_mask,
     )
 
-    g_diag = metric_net(z_t_flat, t_flat, cond_flat, pos_flat)
-    err = (v_pred_flat - v_true_flat).pow(2)
-    metric_loss = (g_diag * err).mean(dim=-1).mean()
-    euclidean_loss = err.mean()
+    g_diag = valid_token_latents(g_full, target_mask)
+    v_nat_pred_flat = valid_token_latents(v_nat_pred, target_mask)
+    force_target = g_diag.detach() * v_true_flat
+    force_err = (v_pred_flat - force_target).pow(2)
+    natural_err = (v_nat_pred_flat - v_true_flat).pow(2)
+    metric_loss = force_err.mean()
+    euclidean_loss = natural_err.mean()
     x0_loss = F.mse_loss(z_x0_flat, z_flat)
     if OT_LOSS_WEIGHT > 0:
         ot_loss, ot_backend = ot_latent_distribution_loss(z_x0, z_target, target_mask)

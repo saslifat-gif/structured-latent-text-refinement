@@ -11,6 +11,26 @@ FlowNet + MetricNet
 natural velocity / metric-aware sampling
 ```
 
+Framework interpretation:
+
+```text
+Option B: true natural-velocity parameterization.
+
+FlowNet predicts a covector / force-like field f_theta.
+MetricNet predicts a positive diagonal metric G=diag(g).
+The latent ODE uses natural velocity v = G^{-1} f_theta, implemented as f_theta / g.
+Training targets the matching covector G u_t, where u_t is the local Euclidean
+residual direction toward the real suffix latent.
+```
+
+This means metric division at rollout and inference is intentional. Future flow
+losses should supervise the force/covector field, not a raw Euclidean velocity,
+unless the architecture is explicitly changed back to a weighted-loss-only setup.
+
+## 2026-05-14
+
+- Committed the Stage 2 Riemannian flow to the Option B natural-velocity interpretation after finding that the local-refinement loss had drifted into direct velocity supervision while inference still used `v / g`. `stage2_losses.py` now trains `FlowNet` as a covector/force predictor with target `g.detach() * v_true`, uses `v_pred / g` for the direct one-step latent prediction, and keeps rollout/inference natural-velocity sampling unchanged. Architecture impact: intentional consistency fix for the protected Riemannian `FlowNet + MetricNet` design. Expected impact: removes train/inference semantic mismatch and should make MetricNet anisotropy meaningful for motion. Risk: old checkpoints trained under weighted velocity loss may not transfer cleanly and should be treated as pre-fix ablations.
+
 ## 2026-05-08
 
 - Added this change log.
