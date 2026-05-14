@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -72,7 +73,19 @@ def compute_mauve(predictions: list[str], references: list[str]) -> float | None
 
     if not predictions or not references:
         return None
-    result = mauve.compute_mauve(p_text=predictions, q_text=references, verbose=False)
+    device_id = int(os.environ.get("MAUVE_DEVICE_ID", "0"))
+    batch_size = int(os.environ.get("MAUVE_BATCH_SIZE", "64"))
+    max_text_length = int(os.environ.get("MAUVE_MAX_TEXT_LENGTH", "128"))
+    model_name = os.environ.get("MAUVE_MODEL_NAME", "gpt2-large")
+    result = mauve.compute_mauve(
+        p_text=predictions,
+        q_text=references,
+        featurize_model_name=model_name,
+        device_id=device_id,
+        batch_size=batch_size,
+        max_text_length=max_text_length,
+        verbose=False,
+    )
     return float(result.mauve)
 
 
@@ -121,15 +134,53 @@ def write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fieldnames: list[str] = []
+    preferred = [
+        "model",
+        "dataset",
+        "latent_dim",
+        "steps",
+        "mauve",
+        "stage1_reconstruction_ce",
+        "decoder_target_probability",
+        "target_token_probability",
+        "distinct_1",
+        "distinct_2",
+        "repetition_rate",
+        "unique_token_ratio",
+        "max_token_fraction",
+        "avg_generated_length",
+        "latency_per_sample",
+        "tokens_per_second",
+        "speedup_vs_gpt2",
+        "status",
+    ]
+    discovered: list[str] = []
     for row in rows:
+        for key in row.keys():
+            if key not in discovered:
+                discovered.append(key)
+    fieldnames = [key for key in preferred if key in discovered]
+    fieldnames.extend(key for key in discovered if key not in fieldnames)
+
+    cleaned_rows: list[dict[str, Any]] = []
+    for row in rows:
+        clean_row: dict[str, Any] = {}
+        for key in fieldnames:
+            value = row.get(key)
+            if isinstance(value, str):
+                value = " ".join(value.split())
+            elif value is None:
+                value = ""
+            clean_row[key] = value
         for key in row:
             if key not in fieldnames:
-                fieldnames.append(key)
+                raise ValueError(f"internal CSV field discovery missed key: {key}")
+        cleaned_rows.append(clean_row)
+
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(cleaned_rows)
 
 
 def append_jsonl(path: str | Path, rows: Iterable[dict[str, Any]]) -> None:

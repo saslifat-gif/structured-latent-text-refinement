@@ -12,6 +12,7 @@ from transformers import BertForMaskedLM, BertTokenizer
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
+import stage2_riemannian as rfm
 from stage2_riemannian import AuxTokenHead, DenoisingPrior, DenoisingPriorSampler, DraftPriorSampler, FlowNet, MetricNet
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -419,7 +420,7 @@ def sample_token_ids(logits, tokenizer, temperature=DECODE_TEMPERATURE, top_k=DE
 
 
 def load_models(stage1_path="stage1_best.pt", stage2_path=None):
-    global FLOW_REFINE_SCALE, VELOCITY_CLAMP
+    global FLOW_REFINE_SCALE, MAX_SEQ_LEN, MLM_DRAFT_LEN, PROMPT_LEN, VELOCITY_CLAMP
     if stage2_path is None:
         adapt_path = "stage2_conditional_decoder_adapt_best.pt"
         stage2_path = adapt_path if os.path.exists(adapt_path) else "stage2_conditional_best.pt"
@@ -436,9 +437,18 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
     ckpt2 = torch.load(stage2_path, map_location=device, weights_only=False)
     print_checkpoint_summary("stage2", stage2_path, ckpt2)
     latent_dim = ckpt2.get("latent_dim", latent_dim)
+    PROMPT_LEN = int(ckpt2.get("prompt_len", PROMPT_LEN))
+    MAX_SEQ_LEN = int(ckpt2.get("max_seq_len", MAX_SEQ_LEN))
+    MLM_DRAFT_LEN = MAX_SEQ_LEN - PROMPT_LEN
+    rfm.PROMPT_LEN = PROMPT_LEN
+    rfm.MAX_SEQ_LEN = MAX_SEQ_LEN
     FLOW_REFINE_SCALE = ckpt2.get("flow_refine_scale", FLOW_REFINE_SCALE)
     VELOCITY_CLAMP = ckpt2.get("velocity_clamp", VELOCITY_CLAMP)
-    print(f"flow_refine_scale={FLOW_REFINE_SCALE:.3f} velocity_clamp={VELOCITY_CLAMP:.3f}", flush=True)
+    print(
+        f"prompt_len={PROMPT_LEN} max_seq_len={MAX_SEQ_LEN} "
+        f"flow_refine_scale={FLOW_REFINE_SCALE:.3f} velocity_clamp={VELOCITY_CLAMP:.3f}",
+        flush=True,
+    )
     flow_net = FlowNet(
         latent_dim=latent_dim,
         hidden_dim=ckpt2.get("flow_hidden_dim", FLOW_HIDDEN_DIM),
