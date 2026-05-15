@@ -48,6 +48,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2", default="stage2_conditional_flow_decoder_joint_best.pt")
     parser.add_argument("--gpt2_model", default="gpt2")
     parser.add_argument(
+        "--hf_baseline_model",
+        default=None,
+        help="Optional Hugging Face causal-LM prompt-only baseline, e.g. Qwen/Qwen3-8B.",
+    )
+    parser.add_argument("--hf_baseline_label", default=None)
+    parser.add_argument("--hf_baseline_batch_size", type=int, default=4)
+    parser.add_argument("--hf_baseline_max_new_tokens", type=int, default=None)
+    parser.add_argument("--hf_baseline_temperature", type=float, default=0.8)
+    parser.add_argument("--hf_baseline_top_p", type=float, default=0.95)
+    parser.add_argument("--hf_baseline_top_k", type=int, default=50)
+    parser.add_argument("--hf_baseline_dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
+    parser.add_argument(
         "--diffusion_lm_file",
         default=None,
         help="Optional local Diffusion-LM predictions, one per benchmark row. Supports JSONL, CSV, or TXT.",
@@ -465,6 +477,80 @@ def generate_gpt2(rows: list[dict[str, Any]], args: argparse.Namespace) -> tuple
     return predictions, time.perf_counter() - start
 
 
+def generate_hf_baseline(rows: list[dict[str, Any]], args: argparse.Namespace) -> tuple[list[str], float]:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if not args.hf_baseline_model:
+        raise RuntimeError("missing --hf_baseline_model")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.hf_baseline_model,
+        local_files_only=args.local_files_only,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    dtype = None
+    if args.hf_baseline_dtype == "float16":
+        dtype = torch.float16
+    elif args.hf_baseline_dtype == "bfloat16":
+        dtype = torch.bfloat16
+    elif args.hf_baseline_dtype == "float32":
+        dtype = torch.float32
+    elif device.type == "cuda":
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    model_kwargs: dict[str, Any] = {
+        "local_files_only": args.local_files_only,
+        "trust_remote_code": True,
+    }
+    if dtype is not None:
+        model_kwargs["torch_dtype"] = dtype
+    if device.type == "cuda":
+        model_kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(args.hf_baseline_model, **model_kwargs)
+    if device.type != "cuda":
+        model = model.to(device)
+    model.eval()
+
+    predictions: list[str] = []
+    batch_size = max(1, args.hf_baseline_batch_size)
+    start = time.perf_counter()
+    for offset in range(0, len(rows), batch_size):
+        batch = rows[offset : offset + batch_size]
+        prompts = [row["prompt"] for row in batch]
+        max_new_tokens = args.hf_baseline_max_new_tokens
+        if max_new_tokens is None:
+            max_new_tokens = max(int(row.get("target_len", args.max_seq_len - args.prompt_len)) for row in batch)
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.prompt_len,
+        )
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=args.hf_baseline_temperature,
+                top_p=args.hf_baseline_top_p,
+                top_k=args.hf_baseline_top_k,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        input_lens = inputs["attention_mask"].sum(dim=1).tolist()
+        for item, input_len in zip(output, input_lens):
+            suffix_ids = item[int(input_len) :]
+            predictions.append(tokenizer.decode(suffix_ids, skip_special_tokens=True).strip())
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    return predictions, time.perf_counter() - start
+
+
 def load_ours(args: argparse.Namespace):
     import inference_stage2_conditional as inf
     from parallel_decoder import cached_from_pretrained
@@ -669,6 +755,28 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
                 sample_rows.append({"table": table_name, "model": "GPT-2", **source, "prediction": pred})
         except Exception as exc:
             table_rows.append({"model": "GPT-2 autoregressive baseline", "status": f"unavailable: {exc}"})
+
+    if args.hf_baseline_model:
+        hf_label = args.hf_baseline_label or args.hf_baseline_model
+        print(f"running Hugging Face causal-LM baseline: {hf_label}", flush=True)
+        try:
+            predictions, latency = generate_hf_baseline(rows, args)
+            hf_row = add_metric_row(
+                model=hf_label,
+                rows=rows,
+                predictions=predictions,
+                latency=latency,
+                latent_dim="-",
+                steps="AR",
+                include_mauve=not args.no_mauve,
+                status=f"prompt-only autoregressive HF baseline; model={args.hf_baseline_model}; split={args.split_strategy}",
+                gpt2_latency_per_sample=gpt2_latency_per_sample,
+            )
+            table_rows.append(hf_row)
+            for source, pred in zip(rows, predictions):
+                sample_rows.append({"table": table_name, "model": hf_label, **source, "prediction": pred})
+        except Exception as exc:
+            table_rows.append({"model": hf_label, "status": f"unavailable: {exc}"})
 
     if args.diffusion_lm_file:
         print(f"scoring local Diffusion-LM predictions from {args.diffusion_lm_file}", flush=True)
