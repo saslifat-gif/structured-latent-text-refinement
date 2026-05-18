@@ -1,22 +1,12 @@
-# Prompt-Conditioned Riemannian Flow Matching in Frozen Language Latent Space
+# Paper
 
-## Abstract
+The current arXiv paper for this project is:
 
-This draft studies text continuation by refining suffix latents in the frozen
-latent space of a BERT-based encoder-decoder. The central hypothesis is that a
-learned diagonal Riemannian metric can weight latent directions according to
-their downstream textual significance, improving flow-matching refinement over a
-flat Euclidean objective.
+- `2605.15557_stage1.pdf`
 
-## Method Sketch
+This Markdown file is intentionally kept as a small index, not a manuscript.
+The previous text in this file was an early sketch of the Stage 2
+Riemannian-flow idea and is now superseded by the arXiv paper.
 
-Stage 1 learns a latent autoencoder for token sequences. Stage 2 conditions on
-prompt latents and learns a velocity field from noisy suffix latents toward clean
-suffix latents. A metric network predicts a positive diagonal metric over the
-same latent coordinates and weights the flow-matching residual.
-
-## Open Questions
-
-- How much of the improvement comes from the metric versus the draft prior?
-- Does the learned metric correlate with decoder sensitivity?
-- Which failure modes remain after auxiliary token and rollout losses?
+Use the PDF as the canonical paper artifact. Future notes can go here only if
+they are clearly marked as planning notes rather than a competing manuscript.
