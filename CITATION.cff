@@ -1,10 +1,32 @@
 cff-version: 1.2.0
-title: Structured Latent Text Refinement
-message: If you use this project, please cite the repository.
+title: "When Latent Geometry Is Not Enough: Draft-Conditioned Latent Refinement for Non-Autoregressive Text Generation"
+message: If you use this project, please cite the arXiv paper.
 type: software
 authors:
-  - family-names: L.
-    given-names: Saslifat
+  - family-names: Zhang
+    given-names: De Shuai
 repository-code: https://github.com/saslifat-gif/structured-latent-text-refinement
+url: https://arxiv.org/abs/2605.15557
+identifiers:
+  - type: doi
+    value: 10.48550/arXiv.2605.15557
+    description: arXiv DOI
+  - type: url
+    value: https://arxiv.org/abs/2605.15557
+    description: arXiv abstract page
 version: 0.1.0
-date-released: 2026-05-12
+date-released: 2026-05-18
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Zhang
+      given-names: De Shuai
+  title: "When Latent Geometry Is Not Enough: Draft-Conditioned Latent Refinement for Non-Autoregressive Text Generation"
+  year: 2026
+  date-published: 2026-05-18
+  url: https://arxiv.org/abs/2605.15557
+  doi: 10.48550/arXiv.2605.15557
+  identifiers:
+    - type: doi
+      value: 10.48550/arXiv.2605.15557
+      description: arXiv DOI
