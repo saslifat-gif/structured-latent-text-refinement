@@ -198,3 +198,4 @@ unless the architecture is explicitly changed back to a weighted-loss-only setup
 - Replaced the stale `paper/draft.md` method sketch with a short paper-folder index pointing to `paper/2605.15557_stage1.pdf` as the canonical paper artifact. No architecture impact; documentation cleanup only.
 - Corrected `paper/draft.md` wording to describe `paper/2605.15557_stage1.pdf` as the current arXiv paper rather than a draft. No architecture impact; documentation wording only.
 - Expanded `examples/ablations.md` and `examples/failure_cases.md` from placeholders into changelog-derived summaries of major ablations, failure modes, diagnostics, and current recommended comparison context. No architecture impact; documentation synthesis only.
+- Updated `CITATION.cff` to cite the arXiv paper `2605.15557`, including the corrected title, author name, arXiv URL, arXiv DOI, May 18 2026 date, and preferred-citation metadata. No architecture impact; citation metadata only.
