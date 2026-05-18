@@ -191,3 +191,10 @@ unless the architecture is explicitly changed back to a weighted-loss-only setup
 ## 2026-05-15
 
 - Added `src/stage1_inferencen.py`, a small direct Stage1 inference CLI that loads a Stage1 checkpoint, runs frozen BERT encoding plus the trained parallel decoder, and prints tokenized originals with reconstructions for supplied text or newline-delimited files. No protected architecture conflict; this is an inference/debug utility only and does not alter DraftPrior, FlowNet, MetricNet, or natural-velocity sampling.
+
+## 2026-05-18
+
+- Added `scripts/train_prompt_prior.py`, a prompt-only deterministic Stage 2 precheck that trains `T_phi(z_prompt) -> z_suffix_draft`, decodes the predicted suffix latents directly with the frozen Stage1 decoder, and reports whether the prompt prior beats a Gaussian suffix latent start on CE, target probability, top-1 confidence, cosine, and saved examples. No protected architecture conflict; this is a diagnostic outside the Riemannian `FlowNet + MetricNet` natural-velocity path and does not modify Stage1 or Stage2 flow code.
+- Replaced the stale `paper/draft.md` method sketch with a short paper-folder index pointing to `paper/2605.15557_stage1.pdf` as the canonical paper artifact. No architecture impact; documentation cleanup only.
+- Corrected `paper/draft.md` wording to describe `paper/2605.15557_stage1.pdf` as the current arXiv paper rather than a draft. No architecture impact; documentation wording only.
+- Expanded `examples/ablations.md` and `examples/failure_cases.md` from placeholders into changelog-derived summaries of major ablations, failure modes, diagnostics, and current recommended comparison context. No architecture impact; documentation synthesis only.
