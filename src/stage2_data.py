@@ -13,7 +13,10 @@ from stage2_config import (
     DATASET_NAME,
     PROMPT_LEN,
     ROCSTORIES_FILE,
+    ROCSTORIES_HUB_CANDIDATES,
+    ROCSTORIES_LOCAL_FILES_ONLY,
     ROCSTORIES_PROMPT_SENTENCES,
+    ROCSTORIES_SOURCE,
     ROCSTORIES_SPLIT,
     ROCSTORIES_TARGET_SENTENCES,
     SEED,
@@ -34,6 +37,22 @@ def split_story_sentences(text):
     return [part.strip() for part in parts if part.strip()]
 
 
+def _clean_sentence_list(value):
+    if isinstance(value, str):
+        return split_story_sentences(value)
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                item_parts = split_story_sentences(item)
+                if len(item_parts) > 1:
+                    parts.extend(item_parts)
+                elif item.strip():
+                    parts.append(" ".join(item.strip().split()))
+        return [part for part in parts if part]
+    return []
+
+
 def sentence_parts_from_row(row):
     sentence_key_sets = [
         [f"sentence{i}" for i in range(1, 6)],
@@ -46,15 +65,58 @@ def sentence_parts_from_row(row):
         if sum(bool(part) for part in parts) >= ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES:
             return parts
 
-    for prompt_key, continuation_key in (("prompt", "continuation"), ("Prompt", "Continuation")):
+    numbered_keys = []
+    for key in row.keys():
+        match = re.fullmatch(r"(?:input_?)?sentence_?(\d+)", str(key), flags=re.IGNORECASE)
+        if match:
+            numbered_keys.append((int(match.group(1)), key))
+    if numbered_keys:
+        parts = [
+            str(row.get(key, "")).strip()
+            for _idx, key in sorted(numbered_keys)
+            if str(row.get(key, "")).strip()
+        ]
+        if len(parts) >= ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES:
+            return parts
+
+    for key in ("sentences", "sentence_list", "story_sentences", "storylines", "storyline"):
+        parts = _clean_sentence_list(row.get(key))
+        if len(parts) >= ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES:
+            return parts
+
+    prompt_continuation_keys = (
+        ("prompt", "continuation"),
+        ("Prompt", "Continuation"),
+        ("prompt", "target"),
+        ("context", "target"),
+        ("input", "output"),
+        ("source", "target"),
+    )
+    for prompt_key, continuation_key in prompt_continuation_keys:
         if row.get(prompt_key) and row.get(continuation_key):
             parts = split_story_sentences(row[prompt_key]) + split_story_sentences(row[continuation_key])
             if len(parts) >= ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES:
                 return parts
 
-    for key in ("story", "text", "full_text", "Story", "Text"):
+    for key in ("target", "story", "text", "full_text", "Story", "Text", "content"):
         if row.get(key):
-            return split_story_sentences(row[key])
+            parts = _clean_sentence_list(row[key])
+            if parts:
+                return parts
+
+    metadata_keys = {"id", "storyid", "story_id", "label", "answer", "source", "split"}
+    string_parts = []
+    for key, value in row.items():
+        if str(key).lower() in metadata_keys:
+            continue
+        if isinstance(value, str) and value.strip():
+            parts = split_story_sentences(value)
+            if len(parts) > 1:
+                string_parts.extend(parts)
+            else:
+                string_parts.append(" ".join(value.strip().split()))
+    if len(string_parts) >= ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES:
+        return string_parts
     return []
 
 
@@ -74,17 +136,118 @@ def read_rocstories_rows(path):
         return [{"text": line.strip()} for line in f if line.strip()]
 
 
-def build_rocstories_dataset(tokenizer, max_length):
-    if not ROCSTORIES_FILE:
+def parse_rocstories_hub_candidates(raw_candidates):
+    candidates = []
+    for item in raw_candidates.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            name, config = item.split(":", 1)
+            candidates.append((name.strip(), config.strip() or None))
+        else:
+            candidates.append((item, None))
+    return candidates or [
+        ("wza/roc_stories", None),
+        ("inkoziev/roc_stories", None),
+        ("igormorgado/ROCStories2018", None),
+        ("mintujupally/ROCStories", None),
+        ("hamishivi/ROCStories", None),
+        ("dwen/rocstories", None),
+        ("story_cloze", "2016"),
+        ("story_cloze", "2018"),
+    ]
+
+
+def load_rocstories_hub_rows(local_files_only):
+    errors = []
+    download_config = DownloadConfig(local_files_only=local_files_only)
+    for name, config in parse_rocstories_hub_candidates(ROCSTORIES_HUB_CANDIDATES):
+        for split in ("train", "validation", "test"):
+            try:
+                if config is None:
+                    dataset = load_dataset(name, split=split, download_config=download_config)
+                else:
+                    dataset = load_dataset(name, config, split=split, download_config=download_config)
+                rows = list(dataset)
+                print(
+                    f"loaded ROCStories-compatible Hub dataset "
+                    f"{name}{('/' + config) if config else ''}/{split} "
+                    f"rows={len(rows)} local_files_only={local_files_only}",
+                    flush=True,
+                )
+                return rows
+            except Exception as exc:
+                errors.append(f"{name}{('/' + config) if config else ''}/{split}: {exc}")
+                parquet_subsets = [config] if config else ["all", "default"]
+                for subset in parquet_subsets:
+                    parquet_path = f"hf://datasets/{name}@refs/convert/parquet/{subset}/{split}/*.parquet"
+                    try:
+                        dataset = load_dataset(
+                            "parquet",
+                            data_files={split: parquet_path},
+                            split=split,
+                            download_config=download_config,
+                        )
+                        rows = list(dataset)
+                        print(
+                            f"loaded ROCStories-compatible Hub parquet "
+                            f"{name}/{subset}/{split} rows={len(rows)} "
+                            f"local_files_only={local_files_only}",
+                            flush=True,
+                        )
+                        return rows
+                    except Exception as parquet_exc:
+                        errors.append(f"parquet {name}/{subset}/{split}: {parquet_exc}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def load_rocstories_rows():
+    source = ROCSTORIES_SOURCE
+    if source not in ("auto", "file", "hub"):
+        raise ValueError("ROCSTORIES_SOURCE must be one of: auto, file, hub")
+
+    file_path = Path(ROCSTORIES_FILE) if ROCSTORIES_FILE else None
+    if source in ("auto", "file") and file_path is not None and file_path.exists():
+        rows = read_rocstories_rows(file_path)
+        print(f"loaded ROCStories rows from file: {file_path} rows={len(rows)}", flush=True)
+        return rows
+
+    if source == "file":
         raise RuntimeError(
-            "SLTR_DATASET=rocstories requires ROCSTORIES_FILE=/path/to/rocstories.csv"
+            "ROCSTORIES_SOURCE=file requires an existing ROCSTORIES_FILE. "
+            f"Current ROCSTORIES_FILE={ROCSTORIES_FILE!r}"
         )
+
+    errors = []
+    if file_path is not None and ROCSTORIES_FILE:
+        errors.append(f"file {file_path} does not exist")
+
+    local_attempts = [True] if ROCSTORIES_LOCAL_FILES_ONLY else [True, False]
+    for local_files_only in local_attempts:
+        try:
+            return load_rocstories_hub_rows(local_files_only=local_files_only)
+        except Exception as exc:
+            label = "cached Hub" if local_files_only else "online Hub"
+            errors.append(f"{label}: {exc}")
+
+    raise RuntimeError(
+        "Could not load ROCStories automatically. "
+        "Set ROCSTORIES_FILE to a local CSV/TSV/JSONL/TXT file, or set "
+        "ROCSTORIES_HUB_CANDIDATES to a Hugging Face dataset id list such as "
+        "`roc_stories,story_cloze:2016,story_cloze:2018`. Tried: "
+        + " | ".join(errors)
+    )
+
+
+def build_rocstories_dataset(tokenizer, max_length):
     suffix_len = max_length - PROMPT_LEN
     if suffix_len <= 0:
         raise ValueError(f"PROMPT_LEN={PROMPT_LEN} must be smaller than MAX_SEQ_LEN={max_length}")
 
+    rows = load_rocstories_rows()
     examples = []
-    for row in read_rocstories_rows(ROCSTORIES_FILE):
+    for row in rows:
         sentences = sentence_parts_from_row(row)
         needed = ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES
         if len(sentences) < needed:
@@ -118,7 +281,9 @@ def build_rocstories_dataset(tokenizer, max_length):
         )
     if not examples:
         raise RuntimeError(
-            f"No ROCStories examples found in {ROCSTORIES_FILE} for split {ROCSTORIES_SPLIT}"
+            f"No ROCStories examples found for split {ROCSTORIES_SPLIT}. "
+            f"source={ROCSTORIES_SOURCE} file={ROCSTORIES_FILE!r}. "
+            f"First row keys={list(rows[0].keys()) if rows else []}"
         )
     return examples
 

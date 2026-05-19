@@ -21,6 +21,21 @@ LATENT_NOISE_STD_FRAC = 0.05
 LATENT_NOISE_WARMUP_FRAC = 0.10
 LATENT_NOISE_MIN_MULT = 0.25
 LATENT_STD_EMA_DECAY = 0.99
+STAGE1_COSMOS_LIKE = os.environ.get("STAGE1_COSMOS_LIKE", "false").lower() in ("1", "true", "yes", "on")
+STAGE1_CLEAN_CE_WEIGHT = float(os.environ.get("STAGE1_CLEAN_CE_WEIGHT", "1.0"))
+STAGE1_NOISY_CE_WEIGHT = float(os.environ.get("STAGE1_NOISY_CE_WEIGHT", "1.0"))
+STAGE1_HIDDEN_CONSISTENCY_WEIGHT = float(os.environ.get("STAGE1_HIDDEN_CONSISTENCY_WEIGHT", "0.1"))
+STAGE1_VARIANT = os.environ.get("STAGE1_VARIANT", "cosmos" if STAGE1_COSMOS_LIKE else "").strip()
+
+
+def checkpoint_variant_suffix():
+    return f"_{STAGE1_VARIANT}" if STAGE1_VARIANT else ""
+
+
+def default_stage1_checkpoint_path():
+    if os.environ.get("SLTR_DATASET") == "rocstories":
+        return f"stage1_rocstories_{LATENT_DIM}{checkpoint_variant_suffix()}_best.pt"
+    return f"stage1{checkpoint_variant_suffix()}_best.pt"
 
 
 def atomic_torch_save(obj, path):
@@ -79,20 +94,26 @@ class ParallelDecoder(nn.Module):
         self.bert      = cached_from_pretrained(BertModel, config=config)
         self.to_logits = nn.Linear(768, vocab_size)
 
-    def forward(self, z, residual_weight=1.0, latent_noise_std=0.0):
+    def forward(self, z, residual_weight=1.0, latent_noise_std=0.0, return_hidden=False):
         # z: [B, seq_len, 768]
         h   = self.compress(z)                             # [B, seq_len, latent_dim]
         if latent_noise_std > 0:
             h = h + torch.randn_like(h) * latent_noise_std
         x   = self.project_up(h) + residual_weight * z    # annealed residual
         out = self.bert(inputs_embeds=x)
-        return self.to_logits(out.last_hidden_state)       # [B, seq_len, vocab_size]
+        logits = self.to_logits(out.last_hidden_state)       # [B, seq_len, vocab_size]
+        if return_hidden:
+            return logits, out.last_hidden_state
+        return logits
 
-    def decode_from_latent(self, z_latent):
+    def decode_from_latent(self, z_latent, return_hidden=False):
         """stage 2 inference: z_latent [B, seq, 256] → logits, no residual"""
         x   = self.project_up(z_latent)
         out = self.bert(inputs_embeds=x)
-        return self.to_logits(out.last_hidden_state)
+        logits = self.to_logits(out.last_hidden_state)
+        if return_hidden:
+            return logits, out.last_hidden_state
+        return logits
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -139,6 +160,12 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
     VOCAB_SIZE    = 30522
     best_val_loss = float("inf")
     latent_std_ema = None
+    print(
+        f"stage1 loss mode | cosmos_like={STAGE1_COSMOS_LIKE} "
+        f"clean_ce={STAGE1_CLEAN_CE_WEIGHT:.3f} noisy_ce={STAGE1_NOISY_CE_WEIGHT:.3f} "
+        f"hidden_consistency={STAGE1_HIDDEN_CONSISTENCY_WEIGHT:.3f}",
+        flush=True,
+    )
 
     for epoch in range(epochs):
         # linear anneal: 1.0 → 0.0 over all epochs
@@ -173,16 +200,56 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 if DENOISE_LATENTS:
                     noise_mult = LATENT_NOISE_MIN_MULT + (1.0 - LATENT_NOISE_MIN_MULT) * noise_warmup
                     latent_noise_std = (LATENT_NOISE_STD_FRAC * noise_mult * latent_std_ema).detach().item()
-                logits = decoder(
-                    z,
-                    residual_weight=residual_weight,
-                    latent_noise_std=latent_noise_std,
-                )
-                loss   = F.cross_entropy(
-                    logits.view(-1, VOCAB_SIZE),
-                    input_ids.view(-1),
-                    ignore_index=0,
-                )
+                if STAGE1_COSMOS_LIKE:
+                    clean_logits, clean_hidden = decoder(
+                        z,
+                        residual_weight=residual_weight,
+                        latent_noise_std=0.0,
+                        return_hidden=True,
+                    )
+                    noisy_logits, noisy_hidden = decoder(
+                        z,
+                        residual_weight=residual_weight,
+                        latent_noise_std=latent_noise_std,
+                        return_hidden=True,
+                    )
+                    clean_ce = F.cross_entropy(
+                        clean_logits.view(-1, VOCAB_SIZE),
+                        input_ids.view(-1),
+                        ignore_index=0,
+                    )
+                    noisy_ce = F.cross_entropy(
+                        noisy_logits.view(-1, VOCAB_SIZE),
+                        input_ids.view(-1),
+                        ignore_index=0,
+                    )
+                    valid_mask = attention_mask.bool()
+                    if valid_mask.any():
+                        hidden_consistency = F.smooth_l1_loss(
+                            noisy_hidden[valid_mask].float(),
+                            clean_hidden.detach()[valid_mask].float(),
+                        )
+                    else:
+                        hidden_consistency = noisy_hidden.new_tensor(0.0)
+                    loss = (
+                        STAGE1_CLEAN_CE_WEIGHT * clean_ce
+                        + STAGE1_NOISY_CE_WEIGHT * noisy_ce
+                        + STAGE1_HIDDEN_CONSISTENCY_WEIGHT * hidden_consistency
+                    )
+                else:
+                    logits = decoder(
+                        z,
+                        residual_weight=residual_weight,
+                        latent_noise_std=latent_noise_std,
+                    )
+                    clean_ce = None
+                    noisy_ce = F.cross_entropy(
+                        logits.view(-1, VOCAB_SIZE),
+                        input_ids.view(-1),
+                        ignore_index=0,
+                    )
+                    hidden_consistency = logits.new_tensor(0.0)
+                    loss = noisy_ce
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -196,6 +263,9 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 print(
                     f"epoch {epoch+1} step {step}/{len(train_loader)}"
                     f" | loss {loss.item():.4f}"
+                    f" | clean_ce {(clean_ce.detach().item() if clean_ce is not None else 0.0):.4f}"
+                    f" | noisy_ce {noisy_ce.detach().item():.4f}"
+                    f" | hcons {hidden_consistency.detach().item():.4f}"
                     f" | residual_weight {residual_weight:.2f}"
                     f" | latent_std {latent_std_ema.item():.4f}"
                     f" | denoise_sigma {latent_noise_std:.5f}"
@@ -249,7 +319,7 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
             best_val_loss = avg_val
             checkpoint_path = os.environ.get(
                 "STAGE1_CHECKPOINT",
-                f"stage1_rocstories_{LATENT_DIM}_best.pt" if os.environ.get("SLTR_DATASET") == "rocstories" else "stage1_best.pt",
+                default_stage1_checkpoint_path(),
             )
             atomic_torch_save({
                 "decoder": decoder.state_dict(),
@@ -261,6 +331,11 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 "latent_noise_warmup_frac": LATENT_NOISE_WARMUP_FRAC,
                 "latent_noise_min_mult": LATENT_NOISE_MIN_MULT,
                 "latent_std_ema": latent_std_ema.detach().item(),
+                "stage1_cosmos_like": STAGE1_COSMOS_LIKE,
+                "stage1_clean_ce_weight": STAGE1_CLEAN_CE_WEIGHT,
+                "stage1_noisy_ce_weight": STAGE1_NOISY_CE_WEIGHT,
+                "stage1_hidden_consistency_weight": STAGE1_HIDDEN_CONSISTENCY_WEIGHT,
+                "stage1_variant": STAGE1_VARIANT,
                 "max_length": MAX_LENGTH,
                 "latent_dim": LATENT_DIM,
                 "train_size": TRAIN_SIZE,
@@ -352,7 +427,7 @@ if __name__ == "__main__":
 
     checkpoint_path = os.environ.get(
         "STAGE1_CHECKPOINT",
-        f"stage1_rocstories_{LATENT_DIM}_best.pt" if os.environ.get("SLTR_DATASET") == "rocstories" else "stage1_best.pt",
+        default_stage1_checkpoint_path(),
     )
     best = torch.load(checkpoint_path, map_location=device, weights_only=False)
     decoder.load_state_dict(best["decoder"])

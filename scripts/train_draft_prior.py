@@ -56,12 +56,28 @@ DRAFT_MSE_WEIGHT = 0.05
 DRAFT_COS_WEIGHT = 0.05
 DRAFT_NORM_WEIGHT = 0.01
 DRAFT_CE_BATCH = 64
+STAGE1_VARIANT = os.environ.get("STAGE1_VARIANT", "").strip()
+DRAFT_PRIOR_VARIANT = os.environ.get("DRAFT_PRIOR_VARIANT", STAGE1_VARIANT).strip()
+
+
+def variant_suffix(variant):
+    return f"_{variant}" if variant else ""
+
+
 CHECKPOINT_PATH = os.environ.get(
     "DRAFT_PRIOR_CHECKPOINT",
-    f"draft_prior_rocstories_{LATENT_DIM}_best.pt" if DATASET_NAME == "rocstories" else "draft_prior_best.pt",
+    (
+        f"draft_prior_rocstories_{LATENT_DIM}{variant_suffix(DRAFT_PRIOR_VARIANT)}_best.pt"
+        if DATASET_NAME == "rocstories"
+        else f"draft_prior{variant_suffix(DRAFT_PRIOR_VARIANT)}_best.pt"
+    ),
 )
 RESUME = False
-CHECKPOINT_PREFIX = f"draft_prior_rocstories_{LATENT_DIM}" if DATASET_NAME == "rocstories" else "draft_prior"
+CHECKPOINT_PREFIX = (
+    f"draft_prior_rocstories_{LATENT_DIM}{variant_suffix(DRAFT_PRIOR_VARIANT)}"
+    if DATASET_NAME == "rocstories"
+    else f"draft_prior{variant_suffix(DRAFT_PRIOR_VARIANT)}"
+)
 
 STAGE2_EVAL_PATH = os.environ.get("DRAFT_PRIOR_STAGE2", "")
 SAVE_EXAMPLES_PATH = "draft_prior_examples.txt"
@@ -92,7 +108,11 @@ decoder = ParallelDecoder(latent_dim=LATENT_DIM).to(device)
 
 STAGE1_CHECKPOINT = os.environ.get(
     "STAGE1_CHECKPOINT",
-    f"stage1_rocstories_{LATENT_DIM}_best.pt" if DATASET_NAME == "rocstories" else "stage1_best.pt",
+    (
+        f"stage1_rocstories_{LATENT_DIM}{variant_suffix(STAGE1_VARIANT)}_best.pt"
+        if DATASET_NAME == "rocstories"
+        else f"stage1{variant_suffix(STAGE1_VARIANT)}_best.pt"
+    ),
 )
 ckpt1 = torch.load(STAGE1_CHECKPOINT, map_location=device, weights_only=False)
 decoder.load_state_dict(ckpt1["decoder"])
@@ -212,6 +232,8 @@ def checkpoint_payload(epoch, drop_prob, replace_prob, val_ce, val_p, val_top1, 
         "denoising_heads": DRAFT_HEADS,
         "denoising_hidden_dim": DRAFT_HIDDEN_DIM,
         "latent_dim": LATENT_DIM,
+        "stage1_variant": STAGE1_VARIANT,
+        "draft_prior_variant": DRAFT_PRIOR_VARIANT,
         "prompt_len": PROMPT_LEN,
         "max_seq_len": MAX_SEQ_LEN,
         "dataset_name": DATASET_NAME,
