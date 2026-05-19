@@ -4,6 +4,24 @@ RESUME = False
 SEED = 1337
 DATASET_NAME = os.environ.get("SLTR_DATASET", "wikitext")
 ROCSTORIES_FILE = os.environ.get("ROCSTORIES_FILE", "")
+ROCSTORIES_SOURCE = os.environ.get("ROCSTORIES_SOURCE", "auto").lower()
+ROCSTORIES_HUB_CANDIDATES = os.environ.get(
+    "ROCSTORIES_HUB_CANDIDATES",
+    ",".join([
+        "wza/roc_stories",
+        "inkoziev/roc_stories",
+        "igormorgado/ROCStories2018",
+        "mintujupally/ROCStories",
+        "hamishivi/ROCStories",
+        "dwen/rocstories",
+        "story_cloze:2016",
+        "story_cloze:2018",
+    ]),
+)
+ROCSTORIES_LOCAL_FILES_ONLY = os.environ.get(
+    "ROCSTORIES_LOCAL_FILES_ONLY",
+    "false",
+).lower() in ("1", "true", "yes", "on")
 ROCSTORIES_PROMPT_SENTENCES = 2
 ROCSTORIES_TARGET_SENTENCES = 3
 ROCSTORIES_SPLIT = "first2_last3"
@@ -11,6 +29,14 @@ PROMPT_LEN = int(os.environ.get("PROMPT_LEN", "32" if DATASET_NAME == "rocstorie
 COND_DROP_PROB = 0.10
 MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "64"))
 LATENT_DIM = int(os.environ.get("LATENT_DIM", "768" if DATASET_NAME == "rocstories" else "256"))
+STAGE1_VARIANT = os.environ.get("STAGE1_VARIANT", "").strip()
+DRAFT_PRIOR_VARIANT = os.environ.get("DRAFT_PRIOR_VARIANT", STAGE1_VARIANT).strip()
+
+
+def variant_suffix(variant):
+    return f"_{variant}" if variant else ""
+
+
 BASE_NOISE_STD = 0.30
 CALIBRATE_GENERATED_LATENTS = True
 TARGET_LATENT_MEAN = -0.003
@@ -66,13 +92,17 @@ START_TRANSFORMER = False
 DENOISING_PRIOR = True
 DENOISING_PRIOR_PATH = os.environ.get(
     "DENOISING_PRIOR_PATH",
-    f"draft_prior_rocstories_{LATENT_DIM}_drop05_best.pt" if DATASET_NAME == "rocstories" else "draft_prior_best.pt",
+    (
+        f"draft_prior_rocstories_{LATENT_DIM}{variant_suffix(DRAFT_PRIOR_VARIANT)}_drop03_best.pt"
+        if DATASET_NAME == "rocstories"
+        else f"draft_prior{variant_suffix(DRAFT_PRIOR_VARIANT)}_best.pt"
+    ),
 )
 DENOISING_PRIOR_ALPHA = 0.7
 DENOISING_PRIOR_FROZEN = True
 DENOISING_PRIOR_ORACLE_ZT = False
 DRAFT_PRIOR = True
-DRAFT_PRIOR_DROP_PROB = float(os.environ.get("DRAFT_PRIOR_DROP_PROB", "0.05"))
+DRAFT_PRIOR_DROP_PROB = float(os.environ.get("DRAFT_PRIOR_DROP_PROB", "0.03"))
 DRAFT_PRIOR_REPLACE_PROB = float(os.environ.get("DRAFT_PRIOR_REPLACE_PROB", "0.0"))
 START_TRANSFORMER_LAYERS = 2
 START_TRANSFORMER_HEADS = 8

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from stage2_config import (
     BASE_NOISE_STD,
@@ -294,6 +295,265 @@ class StartTransformer(nn.Module):
         if mask is not None:
             x = x * mask.to(x.dtype).unsqueeze(-1)
         return x
+
+
+class VQLatentTokenizer(nn.Module):
+    """Per-token latent VQ tokenizer for decoder-readable suffix latents."""
+
+    def __init__(
+        self,
+        latent_dim=256,
+        codebook_size=512,
+        commitment_cost=0.25,
+        use_mlp=False,
+        hidden_dim=512,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.codebook_size = codebook_size
+        self.commitment_cost = commitment_cost
+        self.encoder = (
+            nn.Sequential(
+                nn.LayerNorm(latent_dim),
+                nn.Linear(latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            if use_mlp
+            else nn.Identity()
+        )
+        self.codebook = nn.Embedding(codebook_size, latent_dim)
+        self.decoder = (
+            nn.Sequential(
+                nn.LayerNorm(latent_dim),
+                nn.Linear(latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            if use_mlp
+            else nn.Identity()
+        )
+        nn.init.normal_(self.codebook.weight, mean=TARGET_LATENT_MEAN, std=TARGET_LATENT_STD)
+
+    def quantize_encoded(self, z_e):
+        flat = z_e.reshape(-1, z_e.size(-1)).float()
+        codebook = self.codebook.weight.float()
+        distances = (
+            flat.pow(2).sum(dim=1, keepdim=True)
+            - 2.0 * flat @ codebook.t()
+            + codebook.pow(2).sum(dim=1).unsqueeze(0)
+        )
+        code_ids = distances.argmin(dim=1).reshape(z_e.shape[:-1])
+        z_q = self.codebook(code_ids)
+        return z_q, code_ids
+
+    def encode(self, z, mask=None):
+        z_e = self.encoder(z)
+        _z_q, code_ids = self.quantize_encoded(z_e)
+        if mask is not None:
+            code_ids = code_ids.masked_fill(~mask.bool(), 0)
+        return code_ids
+
+    def decode_codes(self, code_ids, mask=None):
+        z = self.decoder(self.codebook(code_ids))
+        if mask is not None:
+            z = z * mask.to(z.dtype).unsqueeze(-1)
+        return z
+
+    def forward(self, z, mask=None):
+        z_e = self.encoder(z)
+        z_q_raw, code_ids = self.quantize_encoded(z_e)
+        z_q = self.decoder(z_q_raw)
+        if mask is not None:
+            valid = mask.bool().unsqueeze(-1)
+            z_q = z_q * valid.to(z_q.dtype)
+            z_e = z_e * valid.to(z_e.dtype)
+            z = z * valid.to(z.dtype)
+        codebook_loss = F.mse_loss(z_q, z.detach())
+        commitment_loss = F.mse_loss(z_e, z_q_raw.detach())
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
+        return z_q, code_ids, vq_loss, {
+            "codebook_loss": codebook_loss.detach(),
+            "commitment_loss": commitment_loss.detach(),
+        }
+
+    @torch.no_grad()
+    def usage_stats(self, code_ids, mask=None):
+        ids = code_ids[mask.bool()] if mask is not None else code_ids.reshape(-1)
+        if ids.numel() == 0:
+            return 0.0, 100.0, 0
+        counts = torch.bincount(ids.reshape(-1), minlength=self.codebook_size).float()
+        probs = counts / counts.sum().clamp_min(1.0)
+        used = int((counts > 0).sum().item())
+        entropy = -(probs[probs > 0] * probs[probs > 0].log()).sum()
+        perplexity = float(entropy.exp().item())
+        dead_pct = float(100.0 * (self.codebook_size - used) / self.codebook_size)
+        return perplexity, dead_pct, used
+
+
+class CodePrior(nn.Module):
+    """Prompt-conditioned parallel categorical suffix-code predictor."""
+
+    def __init__(
+        self,
+        latent_dim=256,
+        codebook_size=512,
+        num_layers=2,
+        num_heads=8,
+        ffn_dim=512,
+        mixer_layers=2,
+        mixer_kernel=5,
+        mixer_scale=0.5,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.codebook_size = codebook_size
+        self.mixer_scale = mixer_scale
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, ffn_dim)
+            for _ in range(num_layers)
+        ])
+        self.mixers = nn.ModuleList([
+            nn.ModuleDict(
+                {
+                    "norm": nn.LayerNorm(latent_dim),
+                    "conv": nn.Conv1d(
+                        latent_dim,
+                        latent_dim,
+                        kernel_size=mixer_kernel,
+                        padding=mixer_kernel // 2,
+                        groups=latent_dim,
+                    ),
+                    "gate": nn.Linear(latent_dim, latent_dim),
+                    "out": nn.Linear(latent_dim, latent_dim),
+                }
+            )
+            for _ in range(mixer_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, codebook_size)
+
+    def forward(self, z_prompt, pos, mask=None):
+        x = self.pos_proj(pos.unsqueeze(-1))
+        for layer in self.layers:
+            x = layer(x, z_prompt)
+        for mixer in self.mixers:
+            h = mixer["norm"](x)
+            conv = mixer["conv"](h.transpose(1, 2)).transpose(1, 2)
+            gate = torch.sigmoid(mixer["gate"](h))
+            x = x + self.mixer_scale * mixer["out"](conv * gate)
+            if mask is not None:
+                x = x * mask.to(x.dtype).unsqueeze(-1)
+        logits = self.out_proj(self.out_norm(x))
+        if mask is not None:
+            logits = logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        return logits
+
+
+class HierCodePrior(nn.Module):
+    """Prompt -> plan slots -> parallel suffix code logits."""
+
+    def __init__(
+        self,
+        latent_dim=256,
+        codebook_size=512,
+        plan_slots=8,
+        num_layers=2,
+        num_heads=8,
+        ffn_dim=512,
+        mixer_layers=2,
+        mixer_kernel=5,
+        mixer_scale=0.5,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.codebook_size = codebook_size
+        self.plan_slots = plan_slots
+        self.mixer_scale = mixer_scale
+        self.plan_queries = nn.Parameter(torch.randn(plan_slots, latent_dim) * 0.02)
+        self.plan_layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, ffn_dim)
+            for _ in range(num_layers)
+        ])
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.token_layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, ffn_dim)
+            for _ in range(num_layers)
+        ])
+        self.plan_cross = nn.ModuleList([
+            nn.ModuleDict(
+                {
+                    "norm": nn.LayerNorm(latent_dim),
+                    "attn": nn.MultiheadAttention(latent_dim, num_heads, batch_first=True),
+                    "ff": nn.Sequential(
+                        nn.LayerNorm(latent_dim),
+                        nn.Linear(latent_dim, ffn_dim),
+                        nn.GELU(),
+                        nn.Linear(ffn_dim, latent_dim),
+                    ),
+                }
+            )
+            for _ in range(num_layers)
+        ])
+        self.mixers = nn.ModuleList([
+            nn.ModuleDict(
+                {
+                    "norm": nn.LayerNorm(latent_dim),
+                    "conv": nn.Conv1d(
+                        latent_dim,
+                        latent_dim,
+                        kernel_size=mixer_kernel,
+                        padding=mixer_kernel // 2,
+                        groups=latent_dim,
+                    ),
+                    "gate": nn.Linear(latent_dim, latent_dim),
+                    "out": nn.Linear(latent_dim, latent_dim),
+                }
+            )
+            for _ in range(mixer_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, codebook_size)
+
+    def forward(self, z_prompt, pos, mask=None, return_plans=False):
+        batch = z_prompt.size(0)
+        plans = self.plan_queries.unsqueeze(0).expand(batch, -1, -1)
+        for layer in self.plan_layers:
+            plans = layer(plans, z_prompt)
+
+        x = self.pos_proj(pos.unsqueeze(-1))
+        for layer, plan_block in zip(self.token_layers, self.plan_cross):
+            x = layer(x, z_prompt)
+            plan_in = plan_block["norm"](x)
+            plan_out, _ = plan_block["attn"](plan_in, plans, plans, need_weights=False)
+            x = x + plan_out
+            x = x + plan_block["ff"](x)
+            if mask is not None:
+                x = x * mask.to(x.dtype).unsqueeze(-1)
+
+        for mixer in self.mixers:
+            h = mixer["norm"](x)
+            conv = mixer["conv"](h.transpose(1, 2)).transpose(1, 2)
+            gate = torch.sigmoid(mixer["gate"](h))
+            x = x + self.mixer_scale * mixer["out"](conv * gate)
+            if mask is not None:
+                x = x * mask.to(x.dtype).unsqueeze(-1)
+
+        logits = self.out_proj(self.out_norm(x))
+        if mask is not None:
+            logits = logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        if return_plans:
+            return logits, plans
+        return logits
 
 
 class DenoisingPrior(nn.Module):
