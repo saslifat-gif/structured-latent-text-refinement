@@ -267,6 +267,21 @@ def build_rocstories_dataset(tokenizer, max_length):
             max_length=suffix_len,
             padding="max_length",
         )
+        target_sentence_mask = torch.zeros((ROCSTORIES_TARGET_SENTENCES, suffix_len), dtype=torch.bool)
+        cursor = 0
+        for sent_idx, sentence in enumerate(sentences[ROCSTORIES_PROMPT_SENTENCES:needed]):
+            if sent_idx >= ROCSTORIES_TARGET_SENTENCES or cursor >= suffix_len:
+                break
+            sent = tokenizer(
+                sentence,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=max(0, suffix_len - cursor),
+            )
+            sent_len = min(len(sent["input_ids"]), suffix_len - cursor)
+            if sent_len > 0:
+                target_sentence_mask[sent_idx, cursor : cursor + sent_len] = True
+                cursor += sent_len
         if sum(prompt["attention_mask"]) == 0 or sum(target["attention_mask"]) == 0:
             continue
         input_ids = prompt["input_ids"] + target["input_ids"]
@@ -277,6 +292,7 @@ def build_rocstories_dataset(tokenizer, max_length):
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "prompt_token_len": torch.tensor(sum(prompt["attention_mask"]), dtype=torch.long),
                 "target_token_len": torch.tensor(sum(target["attention_mask"]), dtype=torch.long),
+                "target_sentence_mask": target_sentence_mask,
             }
         )
     if not examples:
