@@ -59,6 +59,8 @@ def parse_args():
     parser.add_argument("--ce_weight", type=float, default=1.0)
     parser.add_argument("--draft_keep_weight", type=float, default=0.05)
     parser.add_argument("--repeat_weight", type=float, default=0.05)
+    parser.add_argument("--ban_unused_tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ban_special_tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--decode", choices=("argmax", "sample"), default="sample")
     parser.add_argument("--token_temp", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=30)
@@ -106,6 +108,33 @@ def load_decoder_adapter(path, latent_dim, device):
     for param in adapter.parameters():
         param.requires_grad_(False)
     return adapter, ckpt
+
+
+def build_banned_token_ids(tokenizer, ban_special=True, ban_unused=True):
+    banned = set()
+    if ban_special:
+        for token_id in (
+            tokenizer.pad_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.mask_token_id,
+            tokenizer.unk_token_id,
+        ):
+            if token_id is not None:
+                banned.add(int(token_id))
+    if ban_unused:
+        vocab = tokenizer.get_vocab()
+        for token, token_id in vocab.items():
+            if token.startswith("[unused"):
+                banned.add(int(token_id))
+    return sorted(banned)
+
+
+def mask_invalid_logits(logits, banned_token_ids=None):
+    if not banned_token_ids:
+        return logits
+    ids = torch.as_tensor(banned_token_ids, device=logits.device, dtype=torch.long)
+    return logits.index_fill(-1, ids, torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9)
 
 
 def top_p_filter(probs, top_p):
@@ -213,6 +242,7 @@ def make_draft(args, tokenizer, decoder, vq, prior, adapter, z_prompt, z_target,
         pos = suffix_positions(z_draft.size(0), z_draft.size(1), z_draft.device, z_draft.dtype)
         z_draft = adapter(z_draft, z_prompt, pos, suffix_mask)
     suffix_logits = decode_suffix_logits_in_chunks(args, decoder, z_prompt, z_draft)
+    suffix_logits = mask_invalid_logits(suffix_logits, args.banned_token_ids)
     if args.decode == "sample":
         draft_ids = sample_tokens(suffix_logits, args.token_temp, args.top_k, args.top_p)
     else:
@@ -224,6 +254,7 @@ def make_draft(args, tokenizer, decoder, vq, prior, adapter, z_prompt, z_target,
 def compute_loss(args, model, z_prompt, draft_ids, z_draft, draft_conf, suffix_ids, suffix_mask):
     pos = suffix_positions(z_draft.size(0), z_draft.size(1), z_draft.device, z_draft.dtype)
     logits = model(z_prompt, draft_ids, z_draft, pos, suffix_mask, draft_conf)
+    logits = mask_invalid_logits(logits, args.banned_token_ids)
     ce, stats = token_stats(logits, suffix_ids, suffix_mask, "refined")
     keep_loss = F.cross_entropy(logits[suffix_mask.bool()], draft_ids[suffix_mask.bool()], reduction="mean")
     rep_loss, rep = repeat_loss(logits, suffix_mask)
@@ -249,6 +280,7 @@ def compute_loss(args, model, z_prompt, draft_ids, z_draft, draft_conf, suffix_i
 
 @torch.no_grad()
 def write_examples(path, tokenizer, input_ids, draft_ids, refined_logits, args):
+    refined_logits = mask_invalid_logits(refined_logits, args.banned_token_ids)
     if args.decode == "sample":
         refined_ids = sample_tokens(
             refined_logits[:, : args.example_max_tokens],
@@ -290,6 +322,8 @@ def main():
     print(f"using: {device}", flush=True)
 
     tokenizer = cached_from_pretrained(BertTokenizer)
+    args.banned_token_ids = build_banned_token_ids(tokenizer, args.ban_special_tokens, args.ban_unused_tokens)
+    print(f"banned decoder token ids={len(args.banned_token_ids)}", flush=True)
     encoder, decoder, latent_dim = load_stage1(args.stage1, device)
     vq, _vq_ckpt = load_vq(args.vq, latent_dim, device)
     prior = None
@@ -401,6 +435,9 @@ def main():
                     "prompt_len": args.prompt_len,
                     "max_seq_len": args.max_seq_len,
                     "draft_mode": args.draft_mode,
+                    "ban_unused_tokens": args.ban_unused_tokens,
+                    "ban_special_tokens": args.ban_special_tokens,
+                    "banned_token_ids": args.banned_token_ids,
                     "vq_path": args.vq,
                     "code_prior_path": args.code_prior,
                     "decoder_adapter_path": args.decoder_adapter,
