@@ -61,6 +61,9 @@ def parse_args():
     parser.add_argument("--use_length_heads", action="store_true")
     parser.add_argument("--use_token_head", action="store_true")
     parser.add_argument("--token_head_weight", type=float, default=0.25)
+    parser.add_argument("--ban_unused_tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ban_special_tokens", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--avoid_adjacent_repeats", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min_tokens", type=int, default=8)
     parser.add_argument("--max_decode_tokens", type=int, default=64)
     parser.add_argument("--split", choices=("val", "train"), default="val")
@@ -129,6 +132,32 @@ def load_syntax_refiner(path, latent_dim, vocab_size, device):
     return refiner, ckpt
 
 
+def build_banned_token_ids(tokenizer, ban_special=True, ban_unused=True):
+    banned = set()
+    if ban_special:
+        for token_id in (
+            tokenizer.pad_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.mask_token_id,
+            tokenizer.unk_token_id,
+        ):
+            if token_id is not None:
+                banned.add(int(token_id))
+    if ban_unused:
+        for token, token_id in tokenizer.get_vocab().items():
+            if token.startswith("[unused"):
+                banned.add(int(token_id))
+    return sorted(banned)
+
+
+def mask_invalid_logits(logits, banned_token_ids=None):
+    if not banned_token_ids:
+        return logits
+    ids = torch.as_tensor(banned_token_ids, device=logits.device, dtype=torch.long)
+    return logits.index_fill(-1, ids, torch.finfo(logits.dtype).min if logits.dtype.is_floating_point else -1e9)
+
+
 def load_length_heads(prior_ckpt, latent_dim, device):
     if "valid_head" not in prior_ckpt or "end_head" not in prior_ckpt:
         return None
@@ -172,6 +201,24 @@ def sample_tokens(logits, temp=0.9, top_k=50, top_p=0.95):
     return torch.multinomial(probs.reshape(-1, probs.size(-1)), 1).reshape(logits.shape[:-1])
 
 
+def avoid_adjacent_repeats(ids, logits):
+    if ids.size(1) < 2:
+        return ids
+    fixed = ids.clone()
+    ranked = logits.float().argsort(dim=-1, descending=True)
+    for col in range(1, fixed.size(1)):
+        same = fixed[:, col].eq(fixed[:, col - 1])
+        if not same.any():
+            continue
+        rows = same.nonzero(as_tuple=False).squeeze(1)
+        for row in rows.tolist():
+            for cand in ranked[row, col].tolist():
+                if cand != int(fixed[row, col - 1]):
+                    fixed[row, col] = cand
+                    break
+    return fixed
+
+
 def cutoff_from_length_heads(args, end_logits):
     end_idx = int(end_logits[0].float().argmax().item()) + 1
     end_idx = max(args.min_tokens, end_idx)
@@ -192,12 +239,15 @@ def decode_suffix(args, tokenizer, decoder, z_prompt, z_suffix, cutoff=None, tok
     logits = decoder.decode_from_latent(torch.cat([z_prompt, z_suffix], dim=1))[:, args.prompt_len :, :]
     if token_logits is not None and args.token_head_weight != 0:
         logits = logits + args.token_head_weight * token_logits.to(logits.dtype)
+    logits = mask_invalid_logits(logits, args.banned_token_ids)
     if cutoff is not None:
         logits = logits[:, :cutoff, :]
     if args.decode == "sample":
         ids = sample_tokens(logits, args.token_temp, args.top_k, args.top_p)
     else:
         ids = logits.argmax(dim=-1)
+    if args.avoid_adjacent_repeats:
+        ids = avoid_adjacent_repeats(ids, logits)
     return tokenizer.decode(ids[0], skip_special_tokens=True).strip()
 
 
@@ -206,19 +256,25 @@ def syntax_refine_suffix(args, tokenizer, decoder, syntax_refiner, z_prompt, z_s
     draft_logits = decoder.decode_from_latent(torch.cat([z_prompt, z_suffix], dim=1))[:, args.prompt_len :, :]
     if token_logits is not None and args.token_head_weight != 0:
         draft_logits = draft_logits + args.token_head_weight * token_logits.to(draft_logits.dtype)
+    draft_logits = mask_invalid_logits(draft_logits, args.banned_token_ids)
     if args.decode == "sample":
         draft_ids = sample_tokens(draft_logits, args.token_temp, args.top_k, args.top_p)
     else:
         draft_ids = draft_logits.argmax(dim=-1)
+    if args.avoid_adjacent_repeats:
+        draft_ids = avoid_adjacent_repeats(draft_ids, draft_logits)
     draft_conf = torch.softmax(draft_logits.float(), dim=-1).max(dim=-1).values
     pos = rfm.suffix_positions(z_suffix.size(0), z_suffix.size(1), z_suffix.device, z_suffix.dtype)
     refined_logits = syntax_refiner(z_prompt, draft_ids, z_suffix, pos, suffix_mask, draft_conf)
+    refined_logits = mask_invalid_logits(refined_logits, args.banned_token_ids)
     if cutoff is not None:
         refined_logits = refined_logits[:, :cutoff, :]
     if args.decode == "sample":
         ids = sample_tokens(refined_logits, args.token_temp, args.top_k, args.top_p)
     else:
         ids = refined_logits.argmax(dim=-1)
+    if args.avoid_adjacent_repeats:
+        ids = avoid_adjacent_repeats(ids, refined_logits)
     return tokenizer.decode(ids[0], skip_special_tokens=True).strip()
 
 
@@ -256,6 +312,8 @@ def main():
     print(f"using: {device}", flush=True)
 
     tokenizer = cached_from_pretrained(BertTokenizer)
+    args.banned_token_ids = build_banned_token_ids(tokenizer, args.ban_special_tokens, args.ban_unused_tokens)
+    print(f"banned decoder token ids={len(args.banned_token_ids)}", flush=True)
     encoder, decoder, latent_dim = load_stage1(args.stage1, device)
     vq, _vq_ckpt = load_vq(args.vq, latent_dim, device)
     prior, prior_ckpt = load_code_prior(args.code_prior, latent_dim, vq.codebook_size, device)
@@ -409,6 +467,9 @@ def main():
                         "use_length_heads": args.use_length_heads,
                         "use_token_head": args.use_token_head,
                         "token_head_weight": args.token_head_weight if args.use_token_head else 0.0,
+                        "ban_unused_tokens": args.ban_unused_tokens,
+                        "ban_special_tokens": args.ban_special_tokens,
+                        "avoid_adjacent_repeats": args.avoid_adjacent_repeats,
                         "min_tokens": args.min_tokens,
                         "max_decode_tokens": args.max_decode_tokens,
                     },
