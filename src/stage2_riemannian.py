@@ -391,6 +391,166 @@ class VQLatentTokenizer(nn.Module):
         return perplexity, dead_pct, used
 
 
+class VQDecoderAdapter(nn.Module):
+    """Small residual adapter that makes VQ/generated suffix latents easier to decode."""
+
+    def __init__(
+        self,
+        latent_dim=256,
+        hidden_dim=512,
+        layers=2,
+        delta_scale=0.5,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.delta_scale = delta_scale
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.prompt_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        blocks = []
+        for _ in range(layers):
+            blocks.append(
+                nn.Sequential(
+                    nn.LayerNorm(latent_dim),
+                    nn.Linear(latent_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, latent_dim),
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, latent_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, z_suffix, z_prompt, pos, mask=None, return_delta=False):
+        prompt = self.prompt_proj(z_prompt.mean(dim=1)).unsqueeze(1)
+        x = z_suffix + prompt + self.pos_proj(pos.unsqueeze(-1))
+        for block in self.blocks:
+            x = x + block(x)
+            if mask is not None:
+                x = x * mask.to(x.dtype).unsqueeze(-1)
+        delta = self.delta_scale * self.out_proj(self.out_norm(x))
+        if mask is not None:
+            delta = delta * mask.to(delta.dtype).unsqueeze(-1)
+        out = z_suffix + delta
+        if return_delta:
+            return out, delta
+        return out
+
+
+class SyntaxTokenRefiner(nn.Module):
+    """Prompt + rough draft tokens/latents -> parallel refined suffix token logits."""
+
+    def __init__(
+        self,
+        vocab_size,
+        latent_dim=256,
+        hidden_dim=512,
+        num_layers=3,
+        num_heads=8,
+        mixer_layers=2,
+        mixer_kernel=5,
+        mixer_scale=0.5,
+        pad_token_id=0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.latent_dim = latent_dim
+        self.mixer_scale = mixer_scale
+        self.pad_token_id = pad_token_id
+        self.token_emb = nn.Embedding(vocab_size, latent_dim, padding_idx=pad_token_id)
+        self.latent_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.prompt_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.conf_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.prompt_layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, hidden_dim)
+            for _ in range(num_layers)
+        ])
+        self.self_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim,
+                dropout=0.0,
+                batch_first=True,
+                activation="gelu",
+                norm_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+        self.mixers = nn.ModuleList([
+            nn.ModuleDict(
+                {
+                    "norm": nn.LayerNorm(latent_dim),
+                    "conv": nn.Conv1d(
+                        latent_dim,
+                        latent_dim,
+                        kernel_size=mixer_kernel,
+                        padding=mixer_kernel // 2,
+                        groups=latent_dim,
+                    ),
+                    "gate": nn.Linear(latent_dim, latent_dim),
+                    "out": nn.Linear(latent_dim, latent_dim),
+                }
+            )
+            for _ in range(mixer_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, vocab_size)
+
+    def forward(self, z_prompt, draft_ids, z_draft, pos, suffix_mask=None, draft_conf=None):
+        if draft_conf is None:
+            draft_conf = torch.ones_like(draft_ids, dtype=z_draft.dtype)
+        x = (
+            self.token_emb(draft_ids.clamp(0, self.vocab_size - 1))
+            + self.latent_proj(z_draft)
+            + self.prompt_proj(z_prompt.mean(dim=1)).unsqueeze(1)
+            + self.pos_proj(pos.unsqueeze(-1))
+            + self.conf_proj(draft_conf.to(z_draft.dtype).unsqueeze(-1))
+        )
+        key_padding_mask = None
+        if suffix_mask is not None:
+            key_padding_mask = ~suffix_mask.bool()
+        for prompt_layer, self_layer in zip(self.prompt_layers, self.self_layers):
+            x = prompt_layer(x, z_prompt)
+            x = self_layer(x, src_key_padding_mask=key_padding_mask)
+            if suffix_mask is not None:
+                x = x * suffix_mask.to(x.dtype).unsqueeze(-1)
+        for mixer in self.mixers:
+            h = mixer["norm"](x)
+            conv = mixer["conv"](h.transpose(1, 2)).transpose(1, 2)
+            gate = torch.sigmoid(mixer["gate"](h))
+            x = x + self.mixer_scale * mixer["out"](conv * gate)
+            if suffix_mask is not None:
+                x = x * suffix_mask.to(x.dtype).unsqueeze(-1)
+        logits = self.out_proj(self.out_norm(x))
+        if suffix_mask is not None:
+            logits = logits.masked_fill(~suffix_mask.bool().unsqueeze(-1), 0.0)
+        return logits
+
+
 class CodePrior(nn.Module):
     """Prompt-conditioned parallel categorical suffix-code predictor."""
 
@@ -438,7 +598,7 @@ class CodePrior(nn.Module):
         self.out_norm = nn.LayerNorm(latent_dim)
         self.out_proj = nn.Linear(latent_dim, codebook_size)
 
-    def forward(self, z_prompt, pos, mask=None):
+    def forward(self, z_prompt, pos, mask=None, return_hidden=False):
         x = self.pos_proj(pos.unsqueeze(-1))
         for layer in self.layers:
             x = layer(x, z_prompt)
@@ -452,6 +612,8 @@ class CodePrior(nn.Module):
         logits = self.out_proj(self.out_norm(x))
         if mask is not None:
             logits = logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        if return_hidden:
+            return logits, x
         return logits
 
 
@@ -524,7 +686,7 @@ class HierCodePrior(nn.Module):
         self.out_norm = nn.LayerNorm(latent_dim)
         self.out_proj = nn.Linear(latent_dim, codebook_size)
 
-    def forward(self, z_prompt, pos, mask=None, return_plans=False):
+    def forward(self, z_prompt, pos, mask=None, return_plans=False, return_hidden=False):
         batch = z_prompt.size(0)
         plans = self.plan_queries.unsqueeze(0).expand(batch, -1, -1)
         for layer in self.plan_layers:
@@ -551,8 +713,147 @@ class HierCodePrior(nn.Module):
         logits = self.out_proj(self.out_norm(x))
         if mask is not None:
             logits = logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        if return_plans and return_hidden:
+            return logits, plans, x
         if return_plans:
             return logits, plans
+        if return_hidden:
+            return logits, x
+        return logits
+
+
+class RouteCodePrior(HierCodePrior):
+    """Prompt -> route hubs -> smooth slot routing -> parallel suffix code logits."""
+
+    def __init__(self, *args, route_scale=1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.route_scale = route_scale
+        self.route_norm = nn.LayerNorm(self.latent_dim)
+        self.route_proj = nn.Linear(self.latent_dim, self.plan_slots)
+        self.route_value_proj = nn.Linear(self.latent_dim, self.latent_dim)
+
+    def forward(self, z_prompt, pos, mask=None, return_aux=False, return_hidden=False):
+        code_logits, plans, hidden = super().forward(
+            z_prompt,
+            pos,
+            mask=mask,
+            return_plans=True,
+            return_hidden=True,
+        )
+        route_logits = self.route_proj(self.route_norm(hidden))
+        route_probs = torch.softmax(route_logits, dim=-1)
+        routed = route_probs @ self.route_value_proj(plans)
+        hidden = hidden + self.route_scale * routed
+        if mask is not None:
+            hidden = hidden * mask.to(hidden.dtype).unsqueeze(-1)
+            route_logits = route_logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        code_logits = self.out_proj(self.out_norm(hidden))
+        if mask is not None:
+            code_logits = code_logits.masked_fill(~mask.bool().unsqueeze(-1), 0.0)
+        aux = {
+            "plans": plans,
+            "route_logits": route_logits,
+            "route_probs": route_probs,
+        }
+        if return_aux and return_hidden:
+            return code_logits, aux, hidden
+        if return_aux:
+            return code_logits, aux
+        if return_hidden:
+            return code_logits, hidden
+        return code_logits
+
+
+class MaskedCodeRefiner(nn.Module):
+    """Prompt + partially known VQ codes -> parallel refined code logits."""
+
+    def __init__(
+        self,
+        latent_dim=256,
+        codebook_size=512,
+        num_layers=2,
+        num_heads=8,
+        ffn_dim=512,
+        mixer_layers=2,
+        mixer_kernel=5,
+        mixer_scale=0.5,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.codebook_size = codebook_size
+        self.mixer_scale = mixer_scale
+        self.mask_code = nn.Parameter(torch.randn(latent_dim) * 0.02)
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.known_proj = nn.Sequential(
+            nn.Linear(1, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
+        self.prompt_layers = nn.ModuleList([
+            _StartTransformerLayer(latent_dim, num_heads, ffn_dim)
+            for _ in range(num_layers)
+        ])
+        self.self_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=num_heads,
+                dim_feedforward=ffn_dim,
+                dropout=0.0,
+                batch_first=True,
+                activation="gelu",
+                norm_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+        self.mixers = nn.ModuleList([
+            nn.ModuleDict(
+                {
+                    "norm": nn.LayerNorm(latent_dim),
+                    "conv": nn.Conv1d(
+                        latent_dim,
+                        latent_dim,
+                        kernel_size=mixer_kernel,
+                        padding=mixer_kernel // 2,
+                        groups=latent_dim,
+                    ),
+                    "gate": nn.Linear(latent_dim, latent_dim),
+                    "out": nn.Linear(latent_dim, latent_dim),
+                }
+            )
+            for _ in range(mixer_layers)
+        ])
+        self.out_norm = nn.LayerNorm(latent_dim)
+        self.out_proj = nn.Linear(latent_dim, codebook_size)
+
+    def forward(self, z_prompt, code_emb, known_mask, pos, suffix_mask=None, return_hidden=False):
+        known = known_mask.to(code_emb.dtype).unsqueeze(-1)
+        mask_code = self.mask_code.to(code_emb.dtype).view(1, 1, -1)
+        x = known * code_emb + (1.0 - known) * mask_code
+        x = x + self.pos_proj(pos.unsqueeze(-1)) + self.known_proj(known)
+        key_padding_mask = None
+        if suffix_mask is not None:
+            key_padding_mask = ~suffix_mask.bool()
+        for prompt_layer, self_layer in zip(self.prompt_layers, self.self_layers):
+            x = prompt_layer(x, z_prompt)
+            x = self_layer(x, src_key_padding_mask=key_padding_mask)
+            if suffix_mask is not None:
+                x = x * suffix_mask.to(x.dtype).unsqueeze(-1)
+        for mixer in self.mixers:
+            h = mixer["norm"](x)
+            conv = mixer["conv"](h.transpose(1, 2)).transpose(1, 2)
+            gate = torch.sigmoid(mixer["gate"](h))
+            x = x + self.mixer_scale * mixer["out"](conv * gate)
+            if suffix_mask is not None:
+                x = x * suffix_mask.to(x.dtype).unsqueeze(-1)
+        logits = self.out_proj(self.out_norm(x))
+        if suffix_mask is not None:
+            logits = logits.masked_fill(~suffix_mask.bool().unsqueeze(-1), 0.0)
+        if return_hidden:
+            return logits, x
         return logits
 
 

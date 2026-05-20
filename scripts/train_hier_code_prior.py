@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import BertTokenizer
 
@@ -65,6 +67,8 @@ def parse_args():
     parser.add_argument("--cos_weight", type=float, default=0.05)
     parser.add_argument("--entropy_weight", type=float, default=0.02)
     parser.add_argument("--usage_entropy_weight", type=float, default=0.05)
+    parser.add_argument("--valid_weight", type=float, default=0.25)
+    parser.add_argument("--end_weight", type=float, default=0.50)
     parser.add_argument("--sample_codes", type=int, default=4)
     parser.add_argument("--sample_tau", type=float, default=0.9)
     parser.add_argument("--decode_batch", type=int, default=64)
@@ -96,6 +100,38 @@ def add(total, stats):
     total["n"] = total.get("n", 0) + 1
 
 
+def end_targets_from_mask(mask):
+    target = torch.zeros_like(mask, dtype=torch.float32)
+    lengths = mask.long().sum(dim=1)
+    has_tokens = lengths > 0
+    if has_tokens.any():
+        rows = torch.arange(mask.size(0), device=mask.device)[has_tokens]
+        cols = lengths[has_tokens] - 1
+        target[rows, cols] = 1.0
+    return target
+
+
+def length_losses(valid_logits, end_logits, suffix_mask):
+    valid_target = suffix_mask.float()
+    end_target = end_targets_from_mask(suffix_mask)
+    valid_loss = F.binary_cross_entropy_with_logits(valid_logits, valid_target)
+    end_loss = F.binary_cross_entropy_with_logits(end_logits, end_target)
+    with torch.no_grad():
+        valid_pred = valid_logits.sigmoid().ge(0.5)
+        valid_acc = valid_pred.eq(suffix_mask.bool()).float().mean().item()
+        pred_end = end_logits.argmax(dim=1)
+        true_end = end_target.argmax(dim=1)
+        end_acc = pred_end.eq(true_end).float().mean().item()
+        end_mae = (pred_end.float() - true_end.float()).abs().mean().item()
+    return valid_loss, end_loss, {
+        "valid_loss": valid_loss.detach().item(),
+        "end_loss": end_loss.detach().item(),
+        "valid_acc": valid_acc,
+        "end_acc": end_acc,
+        "end_mae": end_mae,
+    }
+
+
 def main():
     args = parse_args()
     if args.max_seq_len != args.prompt_len + args.suffix_len:
@@ -121,13 +157,19 @@ def main():
         mixer_layers=args.mixer_layers,
         mixer_scale=args.mixer_scale,
     ).to(device)
+    valid_head = nn.Linear(latent_dim, 1).to(device)
+    end_head = nn.Linear(latent_dim, 1).to(device)
     train_loader, val_loader = s2data.build_stage2_dataloaders(
         tokenizer,
         args.train_size,
         args.batch_size,
         args.max_seq_len,
     )
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(
+        list(model.parameters()) + list(valid_head.parameters()) + list(end_head.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     best_ce = float("inf")
     print(
@@ -138,6 +180,8 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
+        valid_head.train()
+        end_head.train()
         total = {}
         iterator = enumerate(train_loader)
         if tqdm is not None:
@@ -154,7 +198,7 @@ def main():
             suffix_ids = input_ids[:, args.prompt_len :]
             pos = suffix_positions(z_target.size(0), z_target.size(1), device, z_target.dtype)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                code_logits = model(z_prompt, pos, suffix_mask)
+                code_logits, prior_hidden = model(z_prompt, pos, suffix_mask, return_hidden=True)
                 loss, stats = compute_losses(
                     args,
                     decoder,
@@ -166,10 +210,18 @@ def main():
                     suffix_ids,
                     suffix_mask,
                 )
+                valid_logits = valid_head(prior_hidden).squeeze(-1)
+                end_logits = end_head(prior_hidden).squeeze(-1)
+                valid_loss, end_loss, length_stats = length_losses(valid_logits, end_logits, suffix_mask)
+                loss = loss + args.valid_weight * valid_loss + args.end_weight * end_loss
+                stats.update(length_stats)
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(valid_head.parameters()) + list(end_head.parameters()),
+                1.0,
+            )
             scaler.step(optimizer)
             scaler.update()
             add(total, stats)
@@ -178,6 +230,7 @@ def main():
                     f"ep{epoch + 1} step {step}/{len(train_loader)} loss={loss.item():.4f} "
                     f"code_ce={stats['code_ce']:.3f} acc={stats['code_acc']:.3f} "
                     f"soft_ce={stats['soft_ce']:.3f} p={stats['soft_p']:.3f} "
+                    f"end_mae={stats['end_mae']:.1f} valid_acc={stats['valid_acc']:.3f} "
                     f"ent={stats['code_entropy']:.2f} usage_ent={stats['usage_entropy']:.2f}",
                     flush=True,
                 )
@@ -190,6 +243,8 @@ def main():
         print(f"ep{epoch + 1} train | {json.dumps(mean(total), indent=2)}", flush=True)
 
         model.eval()
+        valid_head.eval()
+        end_head.eval()
         val_total = {}
         last = None
         with torch.no_grad():
@@ -206,7 +261,7 @@ def main():
                 suffix_ids = input_ids[:, args.prompt_len :]
                 code_targets = vq.encode(z_target, suffix_mask)
                 pos = suffix_positions(z_target.size(0), z_target.size(1), device, z_target.dtype)
-                code_logits = model(z_prompt, pos, suffix_mask)
+                code_logits, prior_hidden = model(z_prompt, pos, suffix_mask, return_hidden=True)
                 _loss, soft = compute_losses(
                     args,
                     decoder,
@@ -218,6 +273,9 @@ def main():
                     suffix_ids,
                     suffix_mask,
                 )
+                valid_logits = valid_head(prior_hidden).squeeze(-1)
+                end_logits = end_head(prior_hidden).squeeze(-1)
+                _valid_loss, _end_loss, length_stats = length_losses(valid_logits, end_logits, suffix_mask)
                 hard, z_hard, _ids = hard_stats(
                     args,
                     decoder,
@@ -230,7 +288,7 @@ def main():
                     suffix_mask,
                 )
                 sample, z_sample = sampled_stats(args, decoder, vq, z_prompt, z_target, code_logits, suffix_ids, suffix_mask)
-                add(val_total, soft | hard | sample)
+                add(val_total, soft | length_stats | hard | sample)
                 last = (z_prompt[:16], (z_sample if z_sample is not None else z_hard)[:16], input_ids[:16])
         val_mean = mean(val_total)
         print(f"val ep{epoch + 1} | {json.dumps(val_mean, indent=2)}", flush=True)
@@ -239,6 +297,8 @@ def main():
             torch.save(
                 {
                     "hier_code_prior": model.state_dict(),
+                    "valid_head": valid_head.state_dict(),
+                    "end_head": end_head.state_dict(),
                     "best_hard_ce": best_ce,
                     "val": val_mean,
                     "latent_dim": latent_dim,
@@ -254,6 +314,9 @@ def main():
                     "tau": args.tau,
                     "entropy_weight": args.entropy_weight,
                     "usage_entropy_weight": args.usage_entropy_weight,
+                    "valid_weight": args.valid_weight,
+                    "end_weight": args.end_weight,
+                    "has_length_heads": True,
                     "sample_codes": args.sample_codes,
                     "sample_tau": args.sample_tau,
                     "vq_path": args.vq,
