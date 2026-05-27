@@ -100,6 +100,8 @@ PROMPT_PRIOR_RANKING_TEMP = float(os.environ.get("PROMPT_PRIOR_RANKING_TEMP", "0
 PROMPT_PRIOR_ADJ_REP_WEIGHT = float(os.environ.get("PROMPT_PRIOR_ADJ_REP_WEIGHT", "0.0"))
 PROMPT_PRIOR_ENTROPY_WEIGHT = float(os.environ.get("PROMPT_PRIOR_ENTROPY_WEIGHT", "0.0"))
 PROMPT_PRIOR_ENTROPY_FLOOR = float(os.environ.get("PROMPT_PRIOR_ENTROPY_FLOOR", "3.5"))
+PROMPT_PRIOR_POS_COLLAPSE_WEIGHT = float(os.environ.get("PROMPT_PRIOR_POS_COLLAPSE_WEIGHT", "0.0"))
+PROMPT_PRIOR_POS_COLLAPSE_MARGIN = float(os.environ.get("PROMPT_PRIOR_POS_COLLAPSE_MARGIN", "0.6"))
 PROMPT_PRIOR_STAGE2 = os.environ.get("PROMPT_PRIOR_STAGE2", "")
 PROMPT_PRIOR_USE_FLOW = os.environ.get("PROMPT_PRIOR_USE_FLOW", "true").lower() in ("1", "true", "yes", "on")
 STAGE1_VARIANT = os.environ.get("STAGE1_VARIANT", "").strip()
@@ -434,6 +436,22 @@ def norm_gap_loss(pred, target, mask):
     return F.smooth_l1_loss(pred_norm, target_norm)
 
 
+def position_collapse_loss(pred, mask=None, margin=0.6):
+    z = F.normalize(pred.float(), dim=-1)
+    sim = torch.matmul(z, z.transpose(1, 2))
+    T = z.size(1)
+    eye = torch.eye(T, device=z.device, dtype=torch.bool).unsqueeze(0)
+    valid = ~eye
+    if mask is not None:
+        m = mask.bool()
+        valid = valid & m.unsqueeze(2) & m.unsqueeze(1)
+    if not valid.any():
+        return pred.new_tensor(0.0), 0.0
+    off_diag = sim[valid]
+    loss = F.relu(off_diag - margin).mean()
+    return loss.to(pred.dtype), off_diag.mean().detach().item()
+
+
 def variance_floor_loss(pred, target, mask):
     if mask is not None and mask.bool().any():
         valid = mask.bool()
@@ -603,6 +621,11 @@ def compute_stats_and_loss(decoder, z_prompt, pred, z_target, suffix_ids, target
     cos_loss, cos_val = rollout_cosine_alignment_loss(pred, z_target, target_mask)
     nloss = norm_gap_loss(pred, z_target, target_mask)
     vloss, pred_std, target_std = variance_floor_loss(pred, z_target, target_mask)
+    pos_collapse, pos_adj_cos = position_collapse_loss(
+        pred,
+        target_mask,
+        PROMPT_PRIOR_POS_COLLAPSE_MARGIN,
+    )
     adj_rep = pred.new_tensor(0.0)
     entropy_floor = pred.new_tensor(0.0)
     entropy_mean = 0.0
@@ -636,6 +659,7 @@ def compute_stats_and_loss(decoder, z_prompt, pred, z_target, suffix_ids, target
         + PROMPT_PRIOR_COS_WEIGHT * cos_loss
         + PROMPT_PRIOR_NORM_WEIGHT * nloss
         + PROMPT_PRIOR_VAR_WEIGHT * vloss
+        + PROMPT_PRIOR_POS_COLLAPSE_WEIGHT * pos_collapse
         + PROMPT_PRIOR_ADJ_REP_WEIGHT * adj_rep
         + PROMPT_PRIOR_ENTROPY_WEIGHT * entropy_floor
     )
@@ -647,6 +671,8 @@ def compute_stats_and_loss(decoder, z_prompt, pred, z_target, suffix_ids, target
         "cos": cos_val,
         "norm": nloss.detach().item(),
         "var": vloss.detach().item(),
+        "pos_collapse": pos_collapse.detach().item(),
+        "pos_adj_cos": pos_adj_cos,
         "adj_rep": adj_rep.detach().item(),
         "entropy_floor": entropy_floor.detach().item(),
         "entropy": entropy_mean,
@@ -687,7 +713,7 @@ def local_output_reward(decoder, z_prompt, z_suffix, target_mask):
 def merge_sample_stats(stats_list, weights=None):
     keys = (
         "ce", "p", "top1", "mse", "cos", "norm", "var",
-        "adj_rep", "entropy_floor", "entropy", "pred_std", "target_std",
+        "pos_collapse", "pos_adj_cos", "adj_rep", "entropy_floor", "entropy", "pred_std", "target_std",
     )
     if weights is None:
         inv = 1.0 / max(len(stats_list), 1)
@@ -822,6 +848,8 @@ def new_stats_total():
         "cos": 0.0,
         "norm": 0.0,
         "var": 0.0,
+        "pos_collapse": 0.0,
+        "pos_adj_cos": 0.0,
         "adj_rep": 0.0,
         "entropy_floor": 0.0,
         "entropy": 0.0,
@@ -837,7 +865,7 @@ def mean_stats(total):
         key: total[key] / n
         for key in (
             "ce", "p", "top1", "mse", "cos", "norm", "var",
-            "adj_rep", "entropy_floor", "entropy", "pred_std", "target_std",
+            "pos_collapse", "pos_adj_cos", "adj_rep", "entropy_floor", "entropy", "pred_std", "target_std",
         )
     }
 
@@ -1095,6 +1123,7 @@ print(
     f"group_samples={PROMPT_PRIOR_GROUP_SAMPLES} ranking_weight={PROMPT_PRIOR_RANKING_WEIGHT:.3f} "
     f"ranking_temp={PROMPT_PRIOR_RANKING_TEMP:.3f} | "
     f"adj_rep_weight={PROMPT_PRIOR_ADJ_REP_WEIGHT:.3f} "
+    f"pos_collapse_weight={PROMPT_PRIOR_POS_COLLAPSE_WEIGHT:.3f}@{PROMPT_PRIOR_POS_COLLAPSE_MARGIN:.2f} "
     f"entropy_weight={PROMPT_PRIOR_ENTROPY_WEIGHT:.3f} entropy_floor={PROMPT_PRIOR_ENTROPY_FLOOR:.2f} | "
     f"seed={SEED} checkpoint={CHECKPOINT_PATH}",
     flush=True,
@@ -1110,6 +1139,8 @@ for epoch in range(PROMPT_PRIOR_EPOCHS):
         "cos": 0.0,
         "norm": 0.0,
         "var": 0.0,
+        "pos_collapse": 0.0,
+        "pos_adj_cos": 0.0,
         "adj_rep": 0.0,
         "entropy_floor": 0.0,
         "entropy": 0.0,
@@ -1204,6 +1235,7 @@ for epoch in range(PROMPT_PRIOR_EPOCHS):
                 f"| ce {stats['ce']:.4f} p={stats['p']:.3f} top1={stats['top1']:.3f} "
                 f"| mse {stats['mse']:.4f} cos {stats['cos']:.3f} norm {stats['norm']:.4f} "
                 f"| var {stats['var']:.5f} std {stats['pred_std']:.3f}/{stats['target_std']:.3f} "
+                f"| pos {stats.get('pos_collapse', 0.0):.4f} adjcos {stats.get('pos_adj_cos', 0.0):.3f} "
                 f"| adj {stats.get('adj_rep', 0.0):.4f} ent {stats.get('entropy', 0.0):.2f} "
                 f"| reward {stats.get('rank_reward', 0.0):.3f} best {stats.get('rank_best_reward', 0.0):.3f}"
             )
@@ -1218,6 +1250,7 @@ for epoch in range(PROMPT_PRIOR_EPOCHS):
         f"ep{epoch + 1} train | avg_loss={train_loss / max(train_total['n'], 1):.4f} "
         f"ce={train_mean['ce']:.3f} p={train_mean['p']:.3f} top1={train_mean['top1']:.3f} "
         f"mse={train_mean['mse']:.4f} cos={train_mean['cos']:.3f} "
+        f"pos={train_mean['pos_collapse']:.4f} adjcos={train_mean['pos_adj_cos']:.3f} "
         f"adj={train_mean['adj_rep']:.4f} ent={train_mean['entropy']:.2f} "
         f"std={train_mean['pred_std']:.3f}/{train_mean['target_std']:.3f}",
         flush=True,
@@ -1321,6 +1354,7 @@ for epoch in range(PROMPT_PRIOR_EPOCHS):
     print(
         f"val ep{epoch + 1} | {val_label} ce={val_mean['ce']:.3f} p={val_mean['p']:.3f} "
         f"top1={val_mean['top1']:.3f} mse={val_mean['mse']:.4f} cos={val_mean['cos']:.3f} "
+        f"pos={val_mean['pos_collapse']:.4f} adjcos={val_mean['pos_adj_cos']:.3f} "
         f"adj={val_mean['adj_rep']:.4f} ent={val_mean['entropy']:.2f} "
         f"std={val_mean['pred_std']:.3f}/{val_mean['target_std']:.3f} "
         f"| gaussian ce={gauss_mean['ce']:.3f} p={gauss_mean['p']:.3f} top1={gauss_mean['top1']:.3f} "
@@ -1365,6 +1399,8 @@ for epoch in range(PROMPT_PRIOR_EPOCHS):
                 "prompt_prior_draft_drop_prob": PROMPT_PRIOR_DRAFT_DROP_PROB,
                 "prompt_prior_draft_replace_prob": PROMPT_PRIOR_DRAFT_REPLACE_PROB,
                 "prompt_prior_var_weight": PROMPT_PRIOR_VAR_WEIGHT,
+                "prompt_prior_pos_collapse_weight": PROMPT_PRIOR_POS_COLLAPSE_WEIGHT,
+                "prompt_prior_pos_collapse_margin": PROMPT_PRIOR_POS_COLLAPSE_MARGIN,
                 "prompt_prior_adj_rep_weight": PROMPT_PRIOR_ADJ_REP_WEIGHT,
                 "prompt_prior_entropy_weight": PROMPT_PRIOR_ENTROPY_WEIGHT,
                 "prompt_prior_entropy_floor": PROMPT_PRIOR_ENTROPY_FLOOR,

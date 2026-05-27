@@ -30,6 +30,7 @@ from parallel_decoder import cached_from_pretrained
 from stage2_config import FLOW_REFINE_SCALE, SEED
 from stage2_losses import rollout_cosine_alignment_loss, rollout_flow_token_ce_loss
 from stage2_riemannian import CodePrior, FlowNet, HierCodePrior, MetricNet, RouteCodePrior, suffix_positions
+from pca_latent_loss import load_pca_basis, pca_subspace_mse
 from train_code_prior import (
     code_usage,
     encode_latents,
@@ -75,6 +76,9 @@ def parse_args():
     parser.add_argument("--ce_weight", type=float, default=1.0)
     parser.add_argument("--hidden_weight", type=float, default=0.05)
     parser.add_argument("--mse_weight", type=float, default=0.05)
+    parser.add_argument("--pca_basis", default="", help="Optional .pt file with PCA mean/components for latent subspace loss.")
+    parser.add_argument("--pca_dims", type=int, default=64)
+    parser.add_argument("--pca_weight", type=float, default=0.0)
     parser.add_argument("--cos_weight", type=float, default=0.05)
     parser.add_argument("--delta_weight", type=float, default=0.01)
     parser.add_argument("--mask_weight", type=float, default=0.1)
@@ -215,7 +219,7 @@ def adjacent_repeat_penalty(logits, suffix_ids, mask):
     return value, value.detach().item()
 
 
-def refiner_losses(args, decoder, flow_net, metric_net, mask_head, z_prompt, z0, z_target, suffix_ids, suffix_mask):
+def refiner_losses(args, decoder, flow_net, metric_net, mask_head, pca_state, z_prompt, z0, z_target, suffix_ids, suffix_mask):
     z_refined = refine_latents(flow_net, metric_net, z0, z_prompt, suffix_mask, args.rollout_steps)
     n_decode = min(args.decode_batch, z_refined.size(0))
     pred_seq = torch.cat([z_prompt[:n_decode], z_refined[:n_decode]], dim=1)
@@ -226,6 +230,11 @@ def refiner_losses(args, decoder, flow_net, metric_net, mask_head, z_prompt, z0,
     ce, p, top1 = rollout_flow_token_ce_loss(logits, suffix_ids[:n_decode], suffix_mask[:n_decode])
     valid = suffix_mask.bool()
     mse = F.mse_loss(z_refined[valid], z_target.detach()[valid]) if valid.any() else F.mse_loss(z_refined, z_target.detach())
+    if pca_state is not None:
+        pca_mean, pca_basis = pca_state
+        pca_loss = pca_subspace_mse(z_refined, z_target, pca_mean, pca_basis, suffix_mask)
+    else:
+        pca_loss = z_refined.new_tensor(0.0)
     cos_loss, cos_val = rollout_cosine_alignment_loss(z_refined, z_target, suffix_mask)
     delta = z_refined - z0.detach()
     delta_reg = delta[valid].pow(2).mean() if valid.any() else delta.pow(2).mean()
@@ -244,6 +253,7 @@ def refiner_losses(args, decoder, flow_net, metric_net, mask_head, z_prompt, z0,
         args.ce_weight * ce
         + args.hidden_weight * hidden_loss
         + args.mse_weight * mse
+        + args.pca_weight * pca_loss
         + args.cos_weight * cos_loss
         + args.delta_weight * delta_reg
         + args.mask_weight * mask_loss
@@ -255,6 +265,8 @@ def refiner_losses(args, decoder, flow_net, metric_net, mask_head, z_prompt, z0,
         "refined_top1": top1,
         "hidden_loss": hidden_loss.detach().item(),
         "mse": mse.detach().item(),
+        "pca_loss": pca_loss.detach().item(),
+        "weighted_pca_loss": (args.pca_weight * pca_loss).detach().item(),
         "cos": cos_val,
         "delta_reg": delta_reg.detach().item(),
         "mask_loss": mask_loss.detach().item(),
@@ -268,6 +280,11 @@ def eval_decode_stats(args, decoder, vq, z_prompt, z_target, z_suffix, ids, suff
     ce, p, top1 = rollout_flow_token_ce_loss(logits, suffix_ids[: args.decode_batch], suffix_mask[: args.decode_batch])
     valid = suffix_mask.bool()
     mse = F.mse_loss(z_suffix[valid], z_target[valid]) if valid.any() else F.mse_loss(z_suffix, z_target)
+    if getattr(args, "pca_state", None) is not None:
+        pca_mean, pca_basis = args.pca_state
+        pca_mse = pca_subspace_mse(z_suffix, z_target, pca_mean, pca_basis, suffix_mask)
+    else:
+        pca_mse = z_suffix.new_tensor(0.0)
     _cos_loss, cos_val = rollout_cosine_alignment_loss(z_suffix, z_target, suffix_mask)
     max_frac, unique_tok, rep_frac, punct_frac = token_collapse_stats(
         decoder,
@@ -282,6 +299,7 @@ def eval_decode_stats(args, decoder, vq, z_prompt, z_target, z_suffix, ids, suff
         f"{prefix}_p": p,
         f"{prefix}_top1": top1,
         f"{prefix}_mse": mse.detach().item(),
+        f"{prefix}_pca_mse": pca_mse.detach().item(),
         f"{prefix}_cos": cos_val,
         f"{prefix}_code_ppl": ppl,
         f"{prefix}_unique_code_ratio": unique_code_ratio,
@@ -316,6 +334,17 @@ def main():
     encoder, decoder, latent_dim = load_stage1(args.stage1, device)
     vq, _vq_ckpt = load_vq(args.vq, latent_dim, device)
     prior, prior_ckpt = load_code_prior(args.code_prior, latent_dim, vq.codebook_size, device)
+    pca_state = None
+    if args.pca_weight > 0:
+        if not args.pca_basis:
+            raise SystemExit("--pca_weight > 0 requires --pca_basis")
+        args.pca_basis = resolve_checkpoint_path(args.pca_basis, "PCA basis")
+        pca_state = load_pca_basis(args.pca_basis, latent_dim, args.pca_dims, device)
+        print(
+            f"PCA subspace loss enabled: dims={pca_state[1].shape[1]} weight={args.pca_weight:g} basis={args.pca_basis}",
+            flush=True,
+        )
+    args.pca_state = pca_state
     flow_net = FlowNet(latent_dim=latent_dim).to(device)
     metric_net = MetricNet(latent_dim=latent_dim).to(device)
     mask_head = ValidMaskHead(latent_dim).to(device)
@@ -367,6 +396,7 @@ def main():
                     flow_net,
                     metric_net,
                     mask_head,
+                    pca_state,
                     z_prompt,
                     z0,
                     z_target,
@@ -387,11 +417,16 @@ def main():
                 print(
                     f"ep{epoch + 1} step {step}/{len(train_loader)} loss={loss.item():.4f} "
                     f"ce={stats['refined_ce']:.3f} p={stats['refined_p']:.3f} "
-                    f"cos={stats['cos']:.3f} rep={stats['repeat_prob']:.3f}",
+                    f"cos={stats['cos']:.3f} pca={stats['pca_loss']:.3f} rep={stats['repeat_prob']:.3f}",
                     flush=True,
                 )
             if tqdm is not None:
-                iterator.set_postfix(ce=f"{stats['refined_ce']:.2f}", p=f"{stats['refined_p']:.3f}", cos=f"{stats['cos']:.2f}")
+                iterator.set_postfix(
+                    ce=f"{stats['refined_ce']:.2f}",
+                    p=f"{stats['refined_p']:.3f}",
+                    cos=f"{stats['cos']:.2f}",
+                    pca=f"{stats['pca_loss']:.2f}",
+                )
         print(f"ep{epoch + 1} train | {json.dumps(mean(total), indent=2)}", flush=True)
 
         flow_net.eval()
@@ -450,6 +485,9 @@ def main():
                     "suffix_len": args.suffix_len,
                     "sample_tau": args.sample_tau,
                     "rollout_steps": args.rollout_steps,
+                    "pca_basis_path": args.pca_basis,
+                    "pca_dims": int(pca_state[1].shape[1]) if pca_state is not None else 0,
+                    "pca_weight": args.pca_weight,
                     "vq_path": args.vq,
                     "code_prior_path": args.code_prior,
                     "type": "codeprior_metric_refiner",
