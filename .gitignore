@@ -27,6 +27,7 @@ dist/
 .vscode/
 
 # Logs and temporary files
+*.jsonl
 *.log
 *.tmp
 tmp/
