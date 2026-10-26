@@ -364,6 +364,33 @@ pure noise
 
 ## Development Notes
 
+### Prompt encoding and draft packing
+
+The main DraftPrior / Stage 2 pipeline encodes the prompt separately from the
+target. With bidirectional BERT, slicing prompt states from a full story would
+leak target information into the conditioning. Target latents still use the
+full story as reconstruction supervision; they are not prompt conditioning.
+
+Training, manual draft inference, and the ROCStories benchmark use fixed prompt
+and suffix slots. Manual drafts may be continuations or full drafts beginning
+with the prompt; continuation tokens start at `PROMPT_LEN` in either case.
+
+Retrain DraftPrior and Stage 2 from scratch after this correction. Old checkpoints
+remain loadable, but their results are not comparable to corrected training.
+New checkpoints record `prompt_encoding: prompt_only`. The Stage 1 autoencoder
+can be reused. Other experimental training branches are outside this correction.
+
+Run the offline input regression checks with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use lightweight tensor/tokenizer doubles and need no model downloads.
+They do not replace checkpoint-based quality evaluation. Benchmark split/reference
+alignment and flow scaling remain separate known issues to resolve before
+reporting comparative results.
+
 Runtime constants currently live partly inside Python modules, especially:
 
 ```text

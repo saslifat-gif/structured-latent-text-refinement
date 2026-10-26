@@ -11,6 +11,7 @@ from transformers import BertTokenizer
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
+from latent_inputs import encode_prompt_latents
 from stage2_config import *
 from stage2_data import build_stage2_dataloaders
 from stage2_eval import evaluate
@@ -521,8 +522,9 @@ for epoch in range(EPOCHS):
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             with torch.no_grad():
                 z_data = decoder.compress(encoder(input_ids, attention_mask))
+                z_prompt = encode_prompt_latents(encoder, decoder, input_ids, attention_mask, PROMPT_LEN)
 
-            z_cond = prompt_condition(z_data, attention_mask)
+            z_cond = prompt_condition(z_prompt, attention_mask)
             drop_mask = torch.rand(z_data.size(0), device=device) < COND_DROP_PROB
             z_cond = z_cond.masked_fill(drop_mask[:, None, None], 0.0)
             z_target = z_data[:, PROMPT_LEN:, :]
@@ -536,7 +538,7 @@ for epoch in range(EPOCHS):
                 target_mask,
                 aux_token_head=aux_token_head,
                 decoder=decoder,
-                z_prompt=z_data[:, :PROMPT_LEN, :],
+                z_prompt=z_prompt,
                 suffix_ids=input_ids[:, PROMPT_LEN:],
                 teacher_decoder=teacher_decoder,
                 start_mlp=start_mlp,
@@ -799,6 +801,7 @@ for epoch in range(EPOCHS):
             "gate_lr_mult": GATE_LR_MULT,
             "max_seq_len": MAX_SEQ_LEN,
             "prompt_len": PROMPT_LEN,
+            "prompt_encoding": "prompt_only",
             "latent_dim": LATENT_DIM,
             "dataset_name": DATASET_NAME,
             "dataset_split": ROCSTORIES_SPLIT if DATASET_NAME == "rocstories" else "legacy_fixed_token",

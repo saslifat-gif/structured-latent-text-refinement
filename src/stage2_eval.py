@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from stage2_config import *
+from latent_inputs import encode_prompt_latents
 from stage2_losses import flow_matching_loss
 from stage2_riemannian import generate_suffix, prompt_condition, suffix_positions
 
@@ -261,7 +262,8 @@ def evaluate(
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 z_data = decoder.compress(encoder(input_ids, attention_mask))
-                z_cond = prompt_condition(z_data, attention_mask)
+                z_prompt = encode_prompt_latents(encoder, decoder, input_ids, attention_mask, PROMPT_LEN)
+                z_cond = prompt_condition(z_prompt, attention_mask)
                 z_target = z_data[:, PROMPT_LEN:, :]
                 target_mask = attention_mask[:, PROMPT_LEN:]
                 z_draft_start = draft_start_fn(input_ids, attention_mask) if draft_start_fn is not None else None
@@ -283,6 +285,10 @@ def evaluate(
         input_ids = batch["input_ids"].to(device)
         attn_mask = batch["attention_mask"].to(device)
         z_real = decoder.compress(encoder(input_ids, attn_mask))
+        z_prompt = encode_prompt_latents(encoder, decoder, input_ids, attn_mask, PROMPT_LEN)
+        # All downstream decode diagnostics must use the same prompt-only prefix.
+        # Target latents remain full-context reconstruction supervision.
+        z_real = torch.cat([z_prompt, z_real[:, PROMPT_LEN:, :]], dim=1)
         B, S, D = z_real.shape
         suffix_mask = attn_mask[:, PROMPT_LEN:].bool()
         z_real_suffix = z_real[:, PROMPT_LEN:, :]

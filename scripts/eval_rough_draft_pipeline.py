@@ -27,6 +27,7 @@ from benchmark_rocstories import corrupt_synthetic_draft, load_rocstories as ben
 from benchmark_rocstories import fixed_suffix_reference, pack_prompt_suffix_inputs
 from eval_text_metrics import tokenize_text
 from parallel_decoder import BertTokenizer, cached_from_pretrained
+from latent_inputs import encode_prompt_latents
 import stage2_data as s2data
 from stage2_config import TARGET_LATENT_MEAN, TARGET_LATENT_STD
 import stage2_riemannian as rfm
@@ -420,9 +421,9 @@ def main() -> None:
         draft_ids = draft_pack["input_ids"].to(device)
         draft_mask = draft_pack["attention_mask"].to(device)
 
-        z_ref = encode_latents(encoder, decoder, ref_ids, ref_mask)
         z_draft_full = encode_latents(encoder, decoder, draft_ids, draft_mask)
-        z_prompt = z_ref[:, : args.prompt_len]
+        with torch.no_grad():
+            z_prompt = encode_prompt_latents(encoder, decoder, ref_ids, ref_mask, args.prompt_len)
         z_draft = z_draft_full[:, args.prompt_len :]
         suffix_ids = ref_ids[:, args.prompt_len :]
         suffix_mask = ref_mask[:, args.prompt_len :]

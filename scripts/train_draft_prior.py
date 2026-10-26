@@ -11,6 +11,7 @@ from transformers import BertTokenizer
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
+from latent_inputs import encode_prompt_latents
 from stage2_config import (
     DATASET_NAME,
     DECODE_LOSS_BATCH,
@@ -235,6 +236,7 @@ def checkpoint_payload(epoch, drop_prob, replace_prob, val_ce, val_p, val_top1, 
         "stage1_variant": STAGE1_VARIANT,
         "draft_prior_variant": DRAFT_PRIOR_VARIANT,
         "prompt_len": PROMPT_LEN,
+        "prompt_encoding": "prompt_only",
         "max_seq_len": MAX_SEQ_LEN,
         "dataset_name": DATASET_NAME,
         "dataset_split": ROCSTORIES_SPLIT if DATASET_NAME == "rocstories" else "legacy_fixed_token",
@@ -310,7 +312,8 @@ def draft_prior_forward(input_ids, attention_mask, drop_prob, replace_prob):
     draft_ids, draft_mask = make_synthetic_draft_ids(input_ids, attention_mask, drop_prob, replace_prob)
     z_real_all = encode_latents(input_ids, attention_mask)
     z_draft_all = encode_latents(draft_ids, draft_mask)
-    z_prompt = z_real_all[:, :PROMPT_LEN, :]
+    with torch.no_grad():
+        z_prompt = encode_prompt_latents(encoder, decoder, input_ids, attention_mask, PROMPT_LEN)
     z_real = z_real_all[:, PROMPT_LEN:, :]
     z_draft = z_draft_all[:, PROMPT_LEN:, :]
     target_mask = attention_mask[:, PROMPT_LEN:]

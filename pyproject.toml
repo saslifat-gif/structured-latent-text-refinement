@@ -13,6 +13,7 @@ dependencies = [
 
 [tool.setuptools]
 py-modules = [
+  "latent_inputs",
   "inference_stage2_conditional",
   "parallel_decoder",
   "stage2_config",

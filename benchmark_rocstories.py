@@ -21,6 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
+from latent_inputs import pack_prompt_suffix_inputs
+
 
 DIFFUSION_LM_REPORTED_MAUVE = 0.043
 SUPPORTED_LOCAL_LATENT_DIMS = {256, 768}
@@ -393,35 +395,6 @@ def corrupt_synthetic_draft(reference: str, seed: int, drop_prob: float = 0.05) 
     rng = random.Random(seed)
     kept = [tok for tok in tokenize_text(reference) if rng.random() >= drop_prob]
     return " ".join(kept) if kept else reference
-
-
-def pack_prompt_suffix_inputs(
-    tokenizer,
-    prompts: list[str],
-    suffixes: list[str],
-    prompt_slots: int,
-    suffix_slots: int,
-) -> dict[str, torch.Tensor]:
-    """Pack text into the same fixed prompt/suffix slots used during training."""
-    prompt_inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        max_length=prompt_slots,
-        padding="max_length",
-        truncation=True,
-    )
-    suffix_inputs = tokenizer(
-        suffixes,
-        return_tensors="pt",
-        max_length=suffix_slots,
-        padding="max_length",
-        truncation=True,
-        add_special_tokens=False,
-    )
-    return {
-        "input_ids": torch.cat([prompt_inputs["input_ids"], suffix_inputs["input_ids"]], dim=1),
-        "attention_mask": torch.cat([prompt_inputs["attention_mask"], suffix_inputs["attention_mask"]], dim=1),
-    }
 
 
 def diffusion_lm_rows() -> list[dict[str, Any]]:
