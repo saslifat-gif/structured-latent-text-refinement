@@ -13,7 +13,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
 from latent_inputs import encode_prompt_latents
 from stage2_config import *
-from stage2_data import build_stage2_dataloaders
+from stage2_data import build_stage2_dataloaders, rocstories_split_metadata, validate_rocstories_checkpoint
 from stage2_eval import evaluate
 from stage2_losses import flow_matching_loss
 from stage2_riemannian import (
@@ -182,10 +182,13 @@ train_loader, val_loader = build_stage2_dataloaders(
     max_length=MAX_SEQ_LEN,
 )
 
+validate_rocstories_checkpoint(checkpoint, "Stage 1")
+
 flow_net = FlowNet(latent_dim=LATENT_DIM, hidden_dim=FLOW_HIDDEN_DIM, depth=FLOW_DEPTH).to(device)
 metric_net = MetricNet(latent_dim=LATENT_DIM, hidden_dim=METRIC_HIDDEN_DIM).to(device)
 if DENOISING_PRIOR:
     _dp_ckpt = torch.load(DENOISING_PRIOR_PATH, map_location=device, weights_only=False)
+    validate_rocstories_checkpoint(_dp_ckpt, "DraftPrior")
     _dp = DenoisingPrior(
         latent_dim=_dp_ckpt.get("latent_dim", LATENT_DIM),
         hidden_dim=_dp_ckpt.get("denoising_hidden_dim", START_TRANSFORMER_HIDDEN_DIM),
@@ -415,6 +418,9 @@ if RESUME:
             )
 
     if ckpt2 is not None:
+        validate_rocstories_checkpoint(ckpt2, "resumed Stage 2")
+        if ckpt2.get("flow_velocity_convention") != "local_path_derivative":
+            raise ValueError("Stage 2 uses the old flow convention; retrain from scratch")
         try:
             flow_state = {k.replace("_orig_mod.", ""): v for k, v in ckpt2["flow_net"].items()}
             flow_net.load_state_dict(flow_state)
@@ -690,6 +696,8 @@ for epoch in range(EPOCHS):
             "x0_loss_weight": X0_LOSS_WEIGHT,
             "decode_loss_weight": DECODE_LOSS_WEIGHT,
             "flow_refine_scale": FLOW_REFINE_SCALE,
+            "flow_velocity_convention": "local_path_derivative",
+            **rocstories_split_metadata(),
             "flow_refine_target_fraction": FLOW_REFINE_TARGET_FRACTION,
             "velocity_clamp": VELOCITY_CLAMP,
             "metric_frozen_steps": METRIC_FROZEN_STEPS,

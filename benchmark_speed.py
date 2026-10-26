@@ -19,7 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ROCStories speed benchmark")
     parser.add_argument("--dataset", default="rocstories", choices=("rocstories",))
     parser.add_argument("--max_seq_len", type=int, default=64)
-    parser.add_argument("--prompt_len", type=int, default=16)
+    parser.add_argument("--prompt_len", type=int, default=32)
+    parser.add_argument("--split_manifest", default=os.environ.get("ROCSTORIES_SPLIT_MANIFEST", "results/rocstories/split_manifest.json"))
     parser.add_argument("--latent_dim", type=int, choices=(128, 256, 768), default=256)
     parser.add_argument("--ode_steps", type=int, nargs="+", choices=(0, 1, 2, 4, 8, 16), default=[0, 4, 16])
     parser.add_argument("--batch_size", type=int, nargs="+", default=[1, 16])
@@ -89,7 +90,8 @@ def main() -> None:
             warmup_cmd.append("--skip_ours")
         if args.local_files_only:
             warmup_cmd.append("--local_files_only")
-        subprocess.run(warmup_cmd, check=False)
+        warmup_cmd.extend(["--prompt_len", str(args.prompt_len), "--max_seq_len", str(args.max_seq_len), "--split_manifest", args.split_manifest])
+        subprocess.run(warmup_cmd, check=True)
 
         for steps in args.ode_steps:
             cmd = [
@@ -123,7 +125,8 @@ def main() -> None:
                 cmd.append("--skip_ours")
             if args.local_files_only:
                 cmd.append("--local_files_only")
-            subprocess.run(cmd, check=False)
+            cmd.extend(["--prompt_len", str(args.prompt_len), "--max_seq_len", str(args.max_seq_len), "--split_manifest", args.split_manifest])
+            subprocess.run(cmd, check=True)
             measured = read_csv(out_dir / f"_speed_bs{batch_size}_steps{steps}" / "fair_comparison.csv")
             for row in measured:
                 row["batch_size"] = batch_size

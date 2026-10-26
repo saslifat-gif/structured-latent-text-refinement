@@ -14,6 +14,7 @@ dependencies = [
 [tool.setuptools]
 py-modules = [
   "latent_inputs",
+  "rocstories_splits",
   "inference_stage2_conditional",
   "parallel_decoder",
   "stage2_config",

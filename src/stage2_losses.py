@@ -476,7 +476,8 @@ def flow_matching_loss(
     natural_err = (v_nat_pred_flat - v_true_flat).pow(2)
     metric_loss = force_err.mean()
     euclidean_loss = natural_err.mean()
-    x0_loss = F.mse_loss(z_x0_flat, z_flat)
+    # z_x0 predicts the local path endpoint, not the full clean-target displacement.
+    x0_loss = F.mse_loss(z_x0_flat, valid_token_latents(z_refine_target, target_mask))
     if OT_LOSS_WEIGHT > 0:
         ot_loss, ot_backend = ot_latent_distribution_loss(z_x0, z_target, target_mask)
     else:

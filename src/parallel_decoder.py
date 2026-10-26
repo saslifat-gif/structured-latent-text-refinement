@@ -155,6 +155,7 @@ def build_dataloaders(tokenizer, train_size=1000000, batch_size=128, max_length=
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4):
+    from stage2_data import rocstories_split_metadata
     optimizer     = AdamW(decoder.parameters(), lr=lr)
     scaler        = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     VOCAB_SIZE    = 30522
@@ -322,6 +323,7 @@ def train(encoder, decoder, train_loader, val_loader, device, epochs=10, lr=1e-4
                 default_stage1_checkpoint_path(),
             )
             atomic_torch_save({
+                **rocstories_split_metadata(),
                 "decoder": decoder.state_dict(),
                 "epoch":   epoch + 1,
                 "val_loss": best_val_loss,
