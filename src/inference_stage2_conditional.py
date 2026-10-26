@@ -12,6 +12,7 @@ from transformers import BertForMaskedLM, BertTokenizer
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from parallel_decoder import BertEncoder, ParallelDecoder, cached_from_pretrained
+from latent_inputs import encode_prompt_latents, pack_prompt_suffix_inputs
 import stage2_riemannian as rfm
 from stage2_riemannian import AuxTokenHead, DenoisingPrior, DenoisingPriorSampler, DraftPriorSampler, FlowNet, MetricNet
 
@@ -274,15 +275,20 @@ def generate_mlm_draft_latents(mlm_model, tokenizer, encoder, decoder, prompt_id
 
 
 def generate_manual_draft_latents(tokenizer, encoder, decoder, prompt_text, draft_text, seq_len, n_samples, device):
-    full_draft = draft_text
-    if prompt_text.lower() not in draft_text.lower():
-        full_draft = f"{prompt_text} {draft_text}"
-    inputs = tokenizer(
-        full_draft,
-        return_tensors="pt",
-        max_length=seq_len,
-        padding="max_length",
-        truncation=True,
+    # Accept either a continuation or a full draft beginning with the prompt.
+    # A prompt mentioned later in the draft is still part of the continuation.
+    prompt_prefix = prompt_text.strip()
+    suffix_text = draft_text.strip()
+    if prompt_prefix and suffix_text.lower().startswith(prompt_prefix.lower()):
+        remainder = suffix_text[len(prompt_prefix):]
+        if not remainder or remainder[0].isspace():
+            suffix_text = remainder.lstrip()
+    inputs = pack_prompt_suffix_inputs(
+        tokenizer,
+        [prompt_text],
+        [suffix_text],
+        PROMPT_LEN,
+        seq_len - PROMPT_LEN,
     )
     full_ids = inputs["input_ids"].to(device).expand(n_samples, -1)
     full_mask = inputs["attention_mask"].to(device).expand(n_samples, -1)
@@ -560,8 +566,7 @@ def generate(
     input_ids = inputs["input_ids"].to(device)
     attention_mask = inputs["attention_mask"].to(device)
 
-    hidden = encoder(input_ids, attention_mask)
-    z_prompt = decoder.compress(hidden)
+    z_prompt = encode_prompt_latents(encoder, decoder, input_ids, attention_mask, PROMPT_LEN)
     z_cond = prompt_condition(z_prompt, attention_mask).expand(n_samples, -1, -1)
     suffix_len = min(seq_len - PROMPT_LEN, MLM_DRAFT_LEN)
     z_prompt_exp = z_prompt.expand(n_samples, PROMPT_LEN, latent_dim)
