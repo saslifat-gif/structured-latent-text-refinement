@@ -4,6 +4,7 @@ RESUME = False
 SEED = 1337
 DATASET_NAME = os.environ.get("SLTR_DATASET", "wikitext")
 ROCSTORIES_FILE = os.environ.get("ROCSTORIES_FILE", "")
+ROCSTORIES_SPLIT_MANIFEST = os.environ.get("ROCSTORIES_SPLIT_MANIFEST", "results/rocstories/split_manifest.json")
 ROCSTORIES_SOURCE = os.environ.get("ROCSTORIES_SOURCE", "auto").lower()
 ROCSTORIES_HUB_CANDIDATES = os.environ.get(
     "ROCSTORIES_HUB_CANDIDATES",
@@ -48,7 +49,8 @@ TRAIN_BATCH_SIZE = int(os.environ.get("TRAIN_BATCH_SIZE", "768" if DATASET_NAME 
 DATALOADER_NUM_WORKERS = 4
 FLOW_HIDDEN_DIM = 512
 FLOW_DEPTH = 5
-FLOW_REFINE_SCALE = 0.01
+# The local endpoint already limits displacement. Do not shrink its velocity again.
+FLOW_REFINE_SCALE = 1.0
 FLOW_REFINE_TARGET_FRACTION = 0.05
 VELOCITY_CLAMP = 2.0
 METRIC_HIDDEN_DIM = 256

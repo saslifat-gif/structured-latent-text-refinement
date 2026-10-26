@@ -34,7 +34,7 @@ from stage2_config import (
     AUX_LOGIT_FUSION_BETA,
     ROCSTORIES_SPLIT,
 )
-from stage2_data import build_stage2_dataloaders
+from stage2_data import build_stage2_dataloaders, rocstories_split_metadata, validate_rocstories_checkpoint
 from stage2_losses import rollout_cosine_alignment_loss, rollout_flow_token_ce_loss
 from stage2_riemannian import AuxTokenHead, DenoisingPrior, FlowNet, MetricNet, suffix_positions
 
@@ -137,6 +137,8 @@ train_loader, val_loader = build_stage2_dataloaders(
     max_length=MAX_SEQ_LEN,
 )
 
+validate_rocstories_checkpoint(ckpt1, "Stage 1")
+
 common_words = [
     "the", "a", "of", "and", "in", "to", "is", "was", "for", "with",
     "on", "as", "by", "from", "that", "this", "it", "are", "were", "be",
@@ -168,6 +170,7 @@ best_scores_by_corruption = {}
 
 if RESUME and os.path.exists(CHECKPOINT_PATH):
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+    validate_rocstories_checkpoint(ckpt, "resumed DraftPrior")
     state = ckpt.get("draft_prior", ckpt.get("denoising_prior"))
     model.load_state_dict(state)
     best_val_score = ckpt.get("best_val_score", float("inf"))
@@ -210,6 +213,7 @@ def corruption_checkpoint_path(drop_prob):
 def checkpoint_payload(epoch, drop_prob, replace_prob, val_ce, val_p, val_top1, val_mse, val_cos, val_norm, score):
     quality_score = val_ce - 2.0 * val_p - val_top1
     return {
+        **rocstories_split_metadata(),
         "draft_prior": model.state_dict(),
         "denoising_prior": model.state_dict(),
         "best_val_score": score,

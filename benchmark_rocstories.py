@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import sys
 import time
@@ -12,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import DownloadConfig, load_dataset
 
 from eval_text_metrics import append_jsonl, compute_text_metrics, ensure_output_dir, tokenize_text, write_csv
 
@@ -22,6 +22,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from latent_inputs import pack_prompt_suffix_inputs
+from rocstories_splits import DEFAULT_MANIFEST, load_split_manifest, make_split_manifest, story_id, validate_checkpoint_split
 
 
 DIFFUSION_LM_REPORTED_MAUVE = 0.043
@@ -33,7 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="rocstories", choices=("rocstories",))
     parser.add_argument("--experiment", choices=("fair", "full", "latent_dim", "all"), default="all")
     parser.add_argument("--max_seq_len", type=int, default=64)
-    parser.add_argument("--prompt_len", type=int, default=16)
+    parser.add_argument("--prompt_len", type=int, default=32)
+    parser.add_argument("--split_manifest", default=os.environ.get("ROCSTORIES_SPLIT_MANIFEST", DEFAULT_MANIFEST))
     parser.add_argument(
         "--split_strategy",
         choices=("sentence", "token"),
@@ -157,12 +159,6 @@ def sentence_split_example(row: dict[str, Any], max_seq_len: int) -> dict[str, A
     target_tokens = tokenize_text(target)
     if not prompt_tokens or not target_tokens:
         return None
-    if len(full_tokens) > max_seq_len:
-        budget = max(max_seq_len - len(prompt_tokens), 1)
-        target_tokens = target_tokens[:budget]
-        full_tokens = prompt_tokens + target_tokens
-    if len(full_tokens) < 8:
-        return None
     return {
         "prompt": prompt,
         "reference": " ".join(target_tokens),
@@ -191,102 +187,84 @@ def token_split_example(row: dict[str, Any], prompt_len: int, max_seq_len: int) 
 
 
 def rows_to_examples(
-    raw_rows: list[dict[str, Any]],
-    num_samples: int,
-    prompt_len: int,
-    max_seq_len: int,
-    split_strategy: str,
-) -> list[dict[str, Any]]:
-    rows = []
+    raw_rows, num_samples, prompt_len, max_seq_len, split_strategy,
+    split_manifest=None,
+):
+    from stage2_data import sentence_parts_from_row as training_sentences
+
+    manifest = load_split_manifest(split_manifest or os.environ.get("ROCSTORIES_SPLIT_MANIFEST", DEFAULT_MANIFEST))
+    stories = {}
     for row in raw_rows:
-        if split_strategy == "sentence":
-            example = sentence_split_example(row, max_seq_len)
-        else:
-            example = token_split_example(row, prompt_len, max_seq_len)
-        if example is None:
-            continue
-        rows.append(example)
-        if len(rows) >= num_samples:
-            break
-    return rows
-
-
-def load_rocstories_file(
-    path: str | Path,
-    num_samples: int,
-    prompt_len: int,
-    max_seq_len: int,
-    split_strategy: str,
-) -> list[dict[str, Any]]:
-    path = Path(path)
-    if not path.exists():
-        raise RuntimeError(f"ROCStories file does not exist: {path}")
-
-    suffix = path.suffix.lower()
-    raw_rows: list[dict[str, Any]] = []
-    if suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
-            raw_rows = [json.loads(line) for line in f if line.strip()]
-    elif suffix in (".csv", ".tsv"):
-        delimiter = "\t" if suffix == ".tsv" else ","
-        with path.open("r", newline="", encoding="utf-8") as f:
-            raw_rows = list(csv.DictReader(f, delimiter=delimiter))
-    else:
-        with path.open("r", encoding="utf-8") as f:
-            raw_rows = [{"text": line.strip()} for line in f if line.strip()]
-
-    rows = rows_to_examples(raw_rows, num_samples, prompt_len, max_seq_len, split_strategy)
+        sentences = training_sentences(row)
+        if len(sentences) >= 5:
+            stories.setdefault(story_id(sentences), sentences[:5])
+    if make_split_manifest(stories, manifest["seed"]) != manifest:
+        raise ValueError("Benchmark corpus differs from the training split manifest")
+    if split_strategy != "sentence":
+        raise ValueError("Held-out ROCStories benchmarking requires split_strategy=sentence")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    rows = []
+    for identity in manifest["splits"]["test"][:num_samples]:
+        sentences = stories[identity]
+        prompt, reference = " ".join(sentences[:2]), " ".join(sentences[2:])
+        rows.append({
+            "story_id": identity, "prompt": prompt, "reference": reference,
+            "full_text": " ".join(sentences), "split_strategy": "sentence",
+            "eval_split": "test", "prompt_len": len(tokenize_text(prompt)),
+            "target_len": len(tokenize_text(reference)),
+        })
     if not rows:
-        raise RuntimeError(
-            f"Loaded {path}, but found no stories long enough for max_seq_len={max_seq_len}. "
-            "For sentence mode, provide five-sentence ROCStories rows. For token mode, rows must have enough tokens."
-        )
+        raise ValueError("No held-out test stories; provide a larger corpus")
     return rows
+
+
+def load_rocstories_file(path, num_samples, prompt_len, max_seq_len, split_strategy, split_manifest=None):
+    from stage2_data import read_rocstories_rows
+
+    return rows_to_examples(
+        read_rocstories_rows(path), num_samples, prompt_len, max_seq_len, split_strategy, split_manifest,
+    )
 
 
 def load_rocstories(
-    num_samples: int,
-    prompt_len: int,
-    max_seq_len: int,
-    local_files_only: bool,
-    rocstories_file: str | None = None,
-    split_strategy: str = "sentence",
-) -> list[dict[str, Any]]:
+    num_samples, prompt_len, max_seq_len, local_files_only,
+    rocstories_file=None, split_strategy="sentence", split_manifest=None,
+):
     if rocstories_file:
-        return load_rocstories_file(rocstories_file, num_samples, prompt_len, max_seq_len, split_strategy)
-
-    errors = []
-    download_config = DownloadConfig(local_files_only=local_files_only)
-    candidates = [
-        ("roc_stories", None),
-        ("story_cloze", "2016"),
-        ("story_cloze", "2018"),
-    ]
-    dataset = None
-    for name, config in candidates:
-        for split in ("validation", "test", "train"):
-            try:
-                if config is None:
-                    dataset = load_dataset(name, split=split, download_config=download_config)
-                else:
-                    dataset = load_dataset(name, config, split=split, download_config=download_config)
-                break
-            except Exception as exc:  # pragma: no cover - depends on local datasets/cache.
-                errors.append(f"{name}/{config}/{split}: {exc}")
-        if dataset is not None:
-            break
-    if dataset is None:
-        raise RuntimeError(
-            "Could not load ROCStories. Install/cache a ROCStories-compatible dataset first. "
-            "The old Hugging Face Story Cloze dataset script may fail on recent `datasets` releases; "
-            "prefer passing a local file with `--rocstories_file path/to/rocstories.csv`. "
-            "Tried: " + " | ".join(errors)
+        return load_rocstories_file(
+            rocstories_file, num_samples, prompt_len, max_seq_len, split_strategy, split_manifest,
         )
+    # Use the same corpus resolver as training rather than a different Hub split.
+    import stage2_data
+    previous = stage2_data.ROCSTORIES_LOCAL_FILES_ONLY
+    try:
+        stage2_data.ROCSTORIES_LOCAL_FILES_ONLY = local_files_only
+        raw_rows = stage2_data.load_rocstories_rows()
+    finally:
+        stage2_data.ROCSTORIES_LOCAL_FILES_ONLY = previous
+    return rows_to_examples(raw_rows, num_samples, prompt_len, max_seq_len, split_strategy, split_manifest)
 
-    rows = rows_to_examples(list(dataset), num_samples, prompt_len, max_seq_len, split_strategy)
-    if not rows:
-        raise RuntimeError("ROCStories loaded, but no examples matched the requested split strategy.")
-    return rows
+
+def canonicalize_eval_rows(rows, tokenizer, prompt_slots, suffix_slots):
+    """Freeze one BERT-slot text budget for all local models and exports."""
+    if prompt_slots < 2 or suffix_slots <= 0:
+        raise ValueError("Need at least two prompt slots and a positive suffix budget")
+    result = []
+    for row in rows:
+        prompt_ids = tokenizer(
+            row["prompt"], truncation=True, max_length=prompt_slots,
+        )["input_ids"]
+        reference = fixed_suffix_reference(row, tokenizer, suffix_slots)
+        result.append({
+            **row,
+            "prompt": tokenizer.decode(prompt_ids, skip_special_tokens=True),
+            "reference": reference,
+            "target_len": len(tokenize_text(reference)),
+            "prompt_len": len(prompt_ids),
+            "suffix_slots": suffix_slots,
+        })
+    return result
 
 
 def attach_manual_drafts(rows: list[dict[str, Any]], manual_draft_file: str | None) -> None:
@@ -355,32 +333,28 @@ def load_prediction_file(path: str | None, expected_count: int, label: str) -> l
         with pred_path.open("r", encoding="utf-8") as f:
             predictions = [line.strip() for line in f if line.strip()]
 
-    if len(predictions) < expected_count:
+    if len(predictions) != expected_count:
         raise RuntimeError(
             f"{label} prediction file has {len(predictions)} rows, but benchmark needs {expected_count}"
         )
-    if len(predictions) > expected_count:
-        predictions = predictions[:expected_count]
     return predictions
 
 
 def export_eval_file(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
     if not args.export_eval_file:
         return
-    from transformers import BertTokenizer
-    from parallel_decoder import cached_from_pretrained
-
-    tokenizer = cached_from_pretrained(BertTokenizer)
-    suffix_slots = checkpoint_suffix_slots(args.stage2, args.max_seq_len, args.prompt_len)
+    suffix_slots = args.max_seq_len - args.prompt_len
     path = Path(args.export_eval_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for idx, row in enumerate(rows):
             item = {
                 "id": idx,
+                "story_id": row["story_id"],
+                "eval_split": "test",
                 "prompt": row["prompt"],
                 "reference": row["reference"],
-                "metric_reference": fixed_suffix_reference(row, tokenizer, suffix_slots),
+                "metric_reference": row["reference"],
                 "full_text": row.get("full_text", ""),
                 "prompt_len": row.get("prompt_len"),
                 "target_len": row.get("target_len"),
@@ -501,8 +475,7 @@ def generate_hf_baseline(rows: list[dict[str, Any]], args: argparse.Namespace) -
             prompts,
             return_tensors="pt",
             padding=True,
-            truncation=True,
-            max_length=args.prompt_len,
+            truncation=False,
         )
         inputs = {key: value.to(model.device) for key, value in inputs.items()}
         with torch.no_grad():
@@ -515,9 +488,10 @@ def generate_hf_baseline(rows: list[dict[str, Any]], args: argparse.Namespace) -
                 top_k=args.hf_baseline_top_k,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        input_lens = inputs["attention_mask"].sum(dim=1).tolist()
-        for item, input_len in zip(output, input_lens):
-            suffix_ids = item[int(input_len) :]
+        # Left-padded generate() outputs include the full padded input width.
+        input_width = inputs["input_ids"].shape[1]
+        for item in output:
+            suffix_ids = item[input_width:]
             predictions.append(tokenizer.decode(suffix_ids, skip_special_tokens=True).strip())
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -689,7 +663,7 @@ def add_metric_row(
         generated_tokens=sum(len(tokenize_text(text)) for text in predictions),
     )
     speedup = None
-    if gpt2_latency_per_sample and metrics["latency_per_sample"]:
+    if gpt2_latency_per_sample and metrics["latency_per_sample"] and "prompt-only" in status:
         speedup = gpt2_latency_per_sample / float(metrics["latency_per_sample"])
     return {
         "model": model,
@@ -697,6 +671,8 @@ def add_metric_row(
         "latent_dim": latent_dim,
         "steps": steps,
         **metrics,
+        "eval_split": "test",
+        "conditioning": "target-derived draft diagnostic" if "synthetic corrupted target" in status else "see status",
         "speedup_vs_gpt2": speedup,
         "status": status,
     }
@@ -709,7 +685,7 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
     gpt2_latency_per_sample = None
 
     if not args.skip_gpt2:
-        print("running GPT-2 autoregressive baseline: 48 autoregressive suffix steps", flush=True)
+        print("running GPT-2 autoregressive baseline on shared test references", flush=True)
         try:
             predictions, latency = generate_gpt2(rows, args)
             gpt2_row = add_metric_row(
@@ -718,7 +694,7 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
                 predictions=predictions,
                 latency=latency,
                 latent_dim="-",
-                steps="48 AR",
+                steps="AR",
                 include_mauve=not args.no_mauve,
                 status=f"reproduced locally; split={args.split_strategy}",
             )
@@ -755,12 +731,8 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
         print(f"scoring local Diffusion-LM predictions from {args.diffusion_lm_file}", flush=True)
         try:
             predictions = load_prediction_file(args.diffusion_lm_file, len(rows), "Diffusion-LM")
-            from transformers import BertTokenizer
-            from parallel_decoder import cached_from_pretrained
-
-            tokenizer = cached_from_pretrained(BertTokenizer)
-            suffix_slots = checkpoint_suffix_slots(args.stage2, args.max_seq_len, args.prompt_len)
-            fixed_refs = [fixed_suffix_reference(row, tokenizer, suffix_slots) for row in rows]
+            suffix_slots = args.max_seq_len - args.prompt_len
+            fixed_refs = [row["reference"] for row in rows]
             table_rows.append(
                 add_metric_row(
                     model=args.diffusion_lm_label,
@@ -803,12 +775,8 @@ def run_table(args: argparse.Namespace, table_name: str, rows: list[dict[str, st
             for steps in steps_list:
                 try:
                     predictions, latency, status = generate_ours(rows, args, steps, latent_dim)
-                    from transformers import BertTokenizer
-                    from parallel_decoder import cached_from_pretrained
-
-                    tokenizer = cached_from_pretrained(BertTokenizer)
-                    suffix_slots = checkpoint_suffix_slots(args.stage2, args.max_seq_len, args.prompt_len)
-                    fixed_refs = [fixed_suffix_reference(row, tokenizer, suffix_slots) for row in rows]
+                    suffix_slots = args.max_seq_len - args.prompt_len
+                    fixed_refs = [row["reference"] for row in rows]
                     table_rows.append(
                         add_metric_row(
                             model=f"Ours DraftPrior + Flow ({label})",
@@ -862,7 +830,25 @@ def main() -> None:
         args.local_files_only,
         args.rocstories_file,
         args.split_strategy,
+        args.split_manifest,
     )
+    manifest = load_split_manifest(args.split_manifest)
+    if not args.skip_ours:
+        stage1 = torch.load(args.stage1, map_location="cpu", weights_only=False)
+        stage2 = torch.load(args.stage2, map_location="cpu", weights_only=False)
+        validate_checkpoint_split(stage1, manifest, "Stage 1")
+        validate_checkpoint_split(stage2, manifest, "Stage 2")
+        if stage2.get("draft_prior") or stage2.get("denoising_prior"):
+            prior_path = stage2.get("draft_prior_path") or stage2.get("denoising_prior_path")
+            prior = torch.load(prior_path, map_location="cpu", weights_only=False)
+            validate_checkpoint_split(prior, manifest, "DraftPrior")
+        args.prompt_len = int(stage2["prompt_len"])
+        args.max_seq_len = int(stage2["max_seq_len"])
+    from transformers import BertTokenizer
+    from parallel_decoder import cached_from_pretrained
+
+    tokenizer = cached_from_pretrained(BertTokenizer)
+    rows = canonicalize_eval_rows(rows, tokenizer, args.prompt_len, args.max_seq_len - args.prompt_len)
     attach_manual_drafts(rows, args.manual_draft_file)
     export_eval_file(args, rows)
     if args.export_only:

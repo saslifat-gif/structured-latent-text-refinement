@@ -133,13 +133,18 @@ Earlier full-transport flow damaged good DraftPrior starts. The current formulat
 v_target = small_fraction * (z_real - z_start)
 ```
 
-and a small ODE update scale:
+and integrates that path derivative without a second shrink factor:
 
 ```text
-z = z + FLOW_REFINE_SCALE * v * dt
+z = z + v * dt  # FLOW_REFINE_SCALE = 1.0
 ```
 
 This reframes the flow as a local editor, not a full generator.
+
+The local target fraction defaults to `0.05`. Endpoint MSE supervises the same
+local endpoint. Old inference checkpoints retain their saved update scale;
+new Stage 2 training must start from scratch under this convention. Velocity
+clipping and final latent calibration remain separate sampler operations.
 
 ---
 
@@ -375,10 +380,48 @@ Training, manual draft inference, and the ROCStories benchmark use fixed prompt
 and suffix slots. Manual drafts may be continuations or full drafts beginning
 with the prompt; continuation tokens start at `PROMPT_LEN` in either case.
 
-Retrain DraftPrior and Stage 2 from scratch after this correction. Old checkpoints
-remain loadable, but their results are not comparable to corrected training.
-New checkpoints record `prompt_encoding: prompt_only`. The Stage 1 autoencoder
-can be reused. Other experimental training branches are outside this correction.
+New checkpoints record `prompt_encoding: prompt_only`. Old checkpoints remain
+loadable for inference, but their results are not comparable to corrected training.
+Other experimental training branches are outside this correction.
+
+### Held-out ROCStories evaluation
+
+Stage 1, DraftPrior, and Stage 2 share content-based story IDs and an approximately
+80/10/10 train/validation/test split. Duplicate stories share an ID. The split is
+stable across input order, and changing `TRAIN_SIZE` does not move training stories
+into validation. Only validation selects checkpoints; the benchmark uses test IDs.
+
+Stage 1 saves the split manifest at `results/rocstories/split_manifest.json`;
+override it with `ROCSTORIES_SPLIT_MANIFEST`. Keep this file with your checkpoints.
+Every stage records its corpus fingerprint, split seed, and split version. Training
+and benchmarking reject checkpoints with missing or mismatched split metadata.
+Changing the corpus or seed requires a new manifest path.
+
+For a clean held-out comparison, retrain **all three stages**, including Stage 1:
+an old autoencoder may have seen stories now assigned to the test split.
+
+```bash
+export SLTR_DATASET=rocstories
+export ROCSTORIES_FILE=/path/to/rocstories.csv
+export LATENT_DIM=768 PROMPT_LEN=32 MAX_SEQ_LEN=64
+export ROCSTORIES_SPLIT_MANIFEST=results/rocstories/split_manifest.json
+python scripts/train_stage1.py
+python scripts/train_draft_prior.py
+python scripts/train_stage2.py
+python benchmark_rocstories.py --experiment fair --latent_dim 768 \
+  --rocstories_file "$ROCSTORIES_FILE" \
+  --stage1 stage1_rocstories_768_best.pt \
+  --stage2 stage2_conditional_flow_decoder_joint_best_rocstories_768.pt \
+  --split_manifest "$ROCSTORIES_SPLIT_MANIFEST" \
+  --skip_reported_diffusion_lm
+```
+
+The benchmark canonicalizes prompts and target references once to the same BERT
+slot budget for every local model. `--export_eval_file` exports those exact texts
+and stable story IDs for external generation. Prediction files must follow that
+exported row order. Synthetic drafts still contain target information: those rows
+are labeled diagnostics, and draft-conditioned rows do not report speedups against
+prompt-only GPT-2. Reported literature scores remain separate external results.
 
 Run the offline input regression checks with:
 
@@ -387,9 +430,9 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use lightweight tensor/tokenizer doubles and need no model downloads.
-They do not replace checkpoint-based quality evaluation. Benchmark split/reference
-alignment and flow scaling remain separate known issues to resolve before
-reporting comparative results.
+They cover prompt isolation, fixed-slot inputs, flow endpoints, disjoint saved
+splits, checkpoint compatibility, and shared scoring references. They do not
+replace checkpoint-based quality or performance evaluation.
 
 Runtime constants currently live partly inside Python modules, especially:
 

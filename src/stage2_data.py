@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 from datasets import DownloadConfig, load_dataset
 from torch.utils.data import DataLoader
+from rocstories_splits import ensure_split_manifest, load_split_manifest, split_metadata, story_id, validate_checkpoint_split
 
 from stage2_config import (
     DATALOADER_NUM_WORKERS,
@@ -18,6 +19,7 @@ from stage2_config import (
     ROCSTORIES_PROMPT_SENTENCES,
     ROCSTORIES_SOURCE,
     ROCSTORIES_SPLIT,
+    ROCSTORIES_SPLIT_MANIFEST,
     ROCSTORIES_TARGET_SENTENCES,
     SEED,
 )
@@ -247,11 +249,16 @@ def build_rocstories_dataset(tokenizer, max_length):
 
     rows = load_rocstories_rows()
     examples = []
+    seen_ids = set()
     for row in rows:
         sentences = sentence_parts_from_row(row)
         needed = ROCSTORIES_PROMPT_SENTENCES + ROCSTORIES_TARGET_SENTENCES
         if len(sentences) < needed:
             continue
+        identity = story_id(sentences)
+        if identity in seen_ids:
+            continue
+        seen_ids.add(identity)
         prompt_text = " ".join(sentences[:ROCSTORIES_PROMPT_SENTENCES])
         target_text = " ".join(sentences[ROCSTORIES_PROMPT_SENTENCES:needed])
         prompt = tokenizer(
@@ -288,6 +295,7 @@ def build_rocstories_dataset(tokenizer, max_length):
         attention_mask = prompt["attention_mask"] + target["attention_mask"]
         examples.append(
             {
+                "story_id": identity,
                 "input_ids": torch.tensor(input_ids, dtype=torch.long),
                 "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 "prompt_token_len": torch.tensor(sum(prompt["attention_mask"]), dtype=torch.long),
@@ -309,10 +317,13 @@ def build_stage2_dataloaders(tokenizer, train_size, batch_size, max_length):
     generator.manual_seed(SEED)
     if DATASET_NAME == "rocstories":
         examples = build_rocstories_dataset(tokenizer, max_length)
-        random.Random(SEED).shuffle(examples)
-        train_size = min(train_size, max(1, int(0.9 * len(examples))))
-        train_rows = examples[:train_size]
-        val_rows = examples[train_size:] or examples[-min(len(examples), 100):]
+        manifest = ensure_split_manifest(ROCSTORIES_SPLIT_MANIFEST, [row["story_id"] for row in examples], SEED)
+        groups = {name: set(ids) for name, ids in manifest["splits"].items()}
+        examples.sort(key=lambda row: row["story_id"])
+        train_rows = [row for row in examples if row["story_id"] in groups["train"]][:train_size]
+        val_rows = [row for row in examples if row["story_id"] in groups["validation"]]
+        if not train_rows or not val_rows:
+            raise ValueError("ROCStories needs nonempty train and validation splits; provide more stories")
         train_loader = DataLoader(
             train_rows,
             batch_size=batch_size,
@@ -395,3 +406,14 @@ def build_stage2_dataloaders(tokenizer, train_size, batch_size, max_length):
         flush=True,
     )
     return train_loader, val_loader
+
+
+def rocstories_split_metadata():
+    if DATASET_NAME != "rocstories":
+        return {}
+    return split_metadata(load_split_manifest(ROCSTORIES_SPLIT_MANIFEST))
+
+
+def validate_rocstories_checkpoint(checkpoint, label):
+    if DATASET_NAME == "rocstories":
+        validate_checkpoint_split(checkpoint, load_split_manifest(ROCSTORIES_SPLIT_MANIFEST), label)

@@ -28,7 +28,7 @@ DECODE_TOP_K = 50
 DECODE_TOP_P = 0.95
 FLOW_HIDDEN_DIM = 512
 FLOW_DEPTH = 5
-FLOW_REFINE_SCALE = 0.01
+FLOW_REFINE_SCALE = 1.0
 VELOCITY_CLAMP = 2.0
 METRIC_HIDDEN_DIM = 256
 METRIC_LOG_BOUND = 0.75
@@ -448,7 +448,8 @@ def load_models(stage1_path="stage1_best.pt", stage2_path=None):
     MLM_DRAFT_LEN = MAX_SEQ_LEN - PROMPT_LEN
     rfm.PROMPT_LEN = PROMPT_LEN
     rfm.MAX_SEQ_LEN = MAX_SEQ_LEN
-    FLOW_REFINE_SCALE = ckpt2.get("flow_refine_scale", FLOW_REFINE_SCALE)
+    # Legacy checkpoints predate the unit-scale path convention.
+    FLOW_REFINE_SCALE = ckpt2.get("flow_refine_scale", 0.01)
     VELOCITY_CLAMP = ckpt2.get("velocity_clamp", VELOCITY_CLAMP)
     print(
         f"prompt_len={PROMPT_LEN} max_seq_len={MAX_SEQ_LEN} "
